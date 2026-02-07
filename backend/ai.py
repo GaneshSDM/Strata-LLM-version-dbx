@@ -4,7 +4,6 @@ import asyncio
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-from openai import OpenAI
 import requests
 from cryptography.fernet import Fernet
 try:
@@ -14,17 +13,13 @@ except Exception:
     # Fallback for direct execution contexts
     from backend.encryption import get_fernet_key  # type: ignore
 
-# Load env vars from both project root .env and backend/.env so AI creds are always picked up.
+# Load env vars from both project root .env and backend/.env.
 ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 print("[AI MODULE] Loading AI module")
-AI_INTEGRATIONS_OPENAI_API_KEY = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY")
-print(f"[AI MODULE] API Key from env: {'FOUND' if AI_INTEGRATIONS_OPENAI_API_KEY else 'NOT FOUND'}")
-AI_INTEGRATIONS_OPENAI_BASE_URL = os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
-AI_INTEGRATIONS_OPENAI_MODEL = os.environ.get("AI_INTEGRATIONS_OPENAI_MODEL")
-print(f"[AI MODULE] Model from env: {AI_INTEGRATIONS_OPENAI_MODEL}")
+# Note: OpenAI integration removed per request. Only Databricks LLM will be used.
 
 # Databricks serving endpoint support (used as primary translator when configured).
 DATABRICKS_LLM_INVOCATIONS_URL = os.environ.get(
@@ -59,24 +54,8 @@ DATABRICKS_CIRCUIT_OPEN_SECONDS = int(os.environ.get("DATABRICKS_LLM_CIRCUIT_OPE
 _databricks_failure_count = 0
 _databricks_circuit_open_until = 0.0
 
-client = None
-if AI_INTEGRATIONS_OPENAI_API_KEY:
-    try:
-        print("[AI MODULE] Initializing OpenAI client")
-        init_params = {"api_key": AI_INTEGRATIONS_OPENAI_API_KEY}
-        if AI_INTEGRATIONS_OPENAI_BASE_URL:
-            init_params["base_url"] = AI_INTEGRATIONS_OPENAI_BASE_URL
-        client = OpenAI(**init_params)
-        print("[AI MODULE] OpenAI client initialized successfully")
-    except Exception as e:
-        print(f"[AI MODULE] Warning: Could not initialize OpenAI client: {e}")
-        client = None
-else:
-    print("[AI MODULE] No API key found, skipping OpenAI client initialization")
-
-# Use the model from environment variable, defaulting to gpt-4o-mini if not set
-model = AI_INTEGRATIONS_OPENAI_MODEL or "gpt-4o-mini"
-print(f"[AI MODULE] Using model: {model}")
+client = None  # No OpenAI client; Databricks LLM will be used exclusively.
+print("[AI MODULE] OpenAI integration disabled – using Databricks LLM only.")
 
 
 def _extract_llm_content(result_json: dict) -> str:
@@ -234,7 +213,6 @@ def _translate_with_databricks_retry(system_prompt: str, input_ddl_json: dict) -
 
 async def translate_schema(source_dialect: str, target_dialect: str, input_ddl_json: dict) -> dict:
     print(f"[AI] Attempting translation from {source_dialect} to {target_dialect}")
-    print(f"[AI] Model being used: {model}")
     print(f"[AI] Number of objects to translate: {len(input_ddl_json.get('objects', []))}")
     
     if "databricks" in (target_dialect or "").lower():
