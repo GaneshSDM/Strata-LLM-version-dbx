@@ -74,10 +74,9 @@ if AI_INTEGRATIONS_OPENAI_API_KEY:
 else:
     print("[AI MODULE] No API key found, skipping OpenAI client initialization")
 
-# Use the model from environment variable only if explicitly set.
-# No default model is provided; rely on Databricks LLM for translations.
-model = AI_INTEGRATIONS_OPENAI_MODEL
-print(f"[AI MODULE] Using model: {model if model else 'None (Databricks only)'}")
+# Use the model from environment variable, defaulting to gpt-4o-mini if not set
+model = AI_INTEGRATIONS_OPENAI_MODEL or "gpt-4o-mini"
+print(f"[AI MODULE] Using model: {model}")
 
 
 def _extract_llm_content(result_json: dict) -> str:
@@ -387,7 +386,7 @@ Output strictly valid JSON:
         print(f"[AI] Databricks translation error: {databricks_error}")
 
     # 2) Secondary path: existing OpenAI client if configured.
-    if client and model:
+    if client:
         try:
             print("[AI] Making API call to OpenAI")
             response = client.chat.completions.create(
@@ -415,7 +414,7 @@ Output strictly valid JSON:
     }
 
 async def suggest_fixes(validation_failures_json: dict) -> dict:
-    if not client or not model:
+    if not client:
         return {
             "fixes": [],
             "error": "OpenAI client not available"
