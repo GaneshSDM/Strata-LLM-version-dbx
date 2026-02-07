@@ -1,0 +1,134 @@
+name: Deploy to GCP VM (Simple)
+
+on:
+  push:
+    branches: ["deploy"]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      # -------------------------------------------------
+      # FRONTEND BUILD
+      # -------------------------------------------------
+      - name: Build Frontend
+        run: |
+          npm install
+          npm run build
+          mkdir -p backend/dist
+          cp -r dist/* backend/dist/
+
+      # -------------------------------------------------
+      # BACKEND DEPENDENCIES
+      # -------------------------------------------------
+      - name: Prepare Backend Dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt -t ./dependencies
+          echo "✓ Backend dependencies prepared"
+
+      # -------------------------------------------------
+      # SCP BACKEND FILES TO VM
+      # -------------------------------------------------
+      - name: Deploy Backend Code and Dependencies
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.GCP_VM_HOST }}
+          username: ${{ secrets.GCP_VM_USER }}
+          key: ${{ secrets.GCP_VM_KEY }}
+          source: "backend/*,nginx.conf,myapp-backend.service"
+          target: "/tmp/deploy"
+
+      # -------------------------------------------------
+      # SSH: SETUP BACKEND ON SERVER
+      # -------------------------------------------------
+      - name: Setup Backend on Server
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.GCP_VM_HOST }}
+          username: ${{ secrets.GCP_VM_USER }}
+          key: ${{ secrets.GCP_VM_KEY }}
+          script: |
+            set -e
+
+            echo "Creating backend directory..."
+            sudo mkdir -p /var/www/myapp/backend
+
+            echo "Fixing permissions..."
+            sudo chown -R $USER:$USER /var/www/myapp
+
+            echo "Deploying backend code..."
+            cp -r /tmp/deploy/backend/* /var/www/myapp/backend/
+
+            echo "Setting up Python virtual environment..."
+            cd /var/www/myapp/backend
+            python3 -m venv venv
+            source venv/bin/activate
+
+            if [ -d "dependencies" ]; then
+              cp -r dependencies/* venv/lib/python*/site-packages/
+            fi
+
+            pip install -r requirements.txt
+
+            echo "Configure nginx..."
+            sudo cp /tmp/deploy/nginx.conf /etc/nginx/sites-available/myapp
+            sudo ln -sf /etc/nginx/sites-available/myapp /etc/nginx/sites-enabled/myapp
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            echo "Setup backend service..."
+            sudo cp /tmp/deploy/myapp-backend.service /etc/systemd/system/
+            sudo systemctl daemon-reload
+            sudo systemctl enable myapp-backend
+            sudo systemctl restart myapp-backend
+
+            echo "Cleanup temp files..."
+            rm -rf /tmp/deploy
+
+            echo "Checking service status..."
+            sudo systemctl status myapp-backend --no-pager
+
+      # -------------------------------------------------
+      # FRONTEND DEPLOY
+      # -------------------------------------------------
+      - name: Deploy Frontend Build
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.GCP_VM_HOST }}
+          username: ${{ secrets.GCP_VM_USER }}
+          key: ${{ secrets.GCP_VM_KEY }}
+          source: "dist/*"
+          target: "/tmp/frontend-build"
+
+      - name: Move Frontend to Web Root
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.GCP_VM_HOST }}
+          username: ${{ secrets.GCP_VM_USER }}
+          key: ${{ secrets.GCP_VM_KEY }}
+          script: |
+            sudo rm -rf /var/www/html/*
+            sudo mv /tmp/frontend-build/* /var/www/html/
+            sudo chown -R www-data:www-data /var/www/html
+            rm -rf /tmp/frontend-build
+            echo "✓ Deployment completed successfully!"
+            echo "Frontend: http://${{ secrets.GCP_VM_HOST }}/"
+            echo "API: http://${{ secrets.GCP_VM_HOST }}/api/hello"

@@ -1,0 +1,15 @@
+[Unit]
+Description=FastAPI Backend Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/var/www/myapp/backend
+Environment="PATH=/var/www/myapp/backend/venv/bin"
+ExecStart=/var/www/myapp/backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

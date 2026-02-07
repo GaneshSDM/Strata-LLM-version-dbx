@@ -1,0 +1,175 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 0 0% 100%;
+  --foreground: 0 0% 9%;
+  --card: 0 0% 100%;
+  --card-foreground: 0 0% 9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 0 0% 9%;
+  --muted: 0 0% 96%;
+  --muted-foreground: 0 0% 45%;
+  --border: 0 0% 91%;
+  --input: 0 0% 91%;
+  --radius: 0.75rem;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+}
+
+/* Glass morphism utilities */
+@layer components {
+  .glass {
+    background: rgba(255, 255, 255, 0.7);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+  }
+
+  .glass-dark {
+    background: rgba(8, 86, 144, 0.05);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(8, 86, 144, 0.1);
+  }
+
+  .glass-card {
+    background: rgba(255, 255, 255, 0.8);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    box-shadow: 0 8px 32px 0 rgba(8, 86, 144, 0.1);
+  }
+
+  .gradient-border {
+    position: relative;
+    background: white;
+    border-radius: 0.75rem;
+  }
+
+  .gradient-border::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: 0.75rem;
+    padding: 2px;
+    background: linear-gradient(135deg, #085690, #ec6225);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+  }
+
+  .aurora-bg {
+    background: linear-gradient(135deg, 
+      rgba(8, 86, 144, 0.03) 0%, 
+      rgba(236, 98, 37, 0.03) 50%,
+      rgba(8, 86, 144, 0.03) 100%
+    );
+    background-size: 200% 200%;
+    animation: aurora 15s ease infinite;
+  }
+
+  @keyframes aurora {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+
+  .btn-primary {
+    @apply bg-gradient-to-r from-accent-500 to-accent-600 text-white font-medium px-6 py-2.5 rounded-lg transition-all duration-200;
+  }
+
+  .btn-accent {
+    @apply bg-gradient-to-r from-accent-500 to-accent-600 text-white font-medium px-6 py-2.5 rounded-lg transition-all duration-200;
+  }
+
+  .btn-gradient {
+    @apply bg-gradient-to-r from-accent-500 to-accent-600 text-white font-medium px-6 py-2.5 rounded-lg transition-all duration-200;
+  }
+
+  .btn-export {
+    min-width: 140px;
+    @apply px-4 py-2 text-sm rounded-lg font-semibold transition-all duration-200;
+  }
+
+  .card-modern {
+    @apply bg-white rounded-xl border border-gray-100 shadow-sm transition-all duration-300 overflow-hidden;
+  }
+
+  .card-glass {
+    @apply glass-card rounded-xl overflow-hidden transition-all duration-300;
+  }
+
+  .input-modern {
+    @apply w-full px-4 py-2.5 rounded-lg border border-gray-200 transition-all duration-200 outline-none bg-white;
+  }
+
+  .badge-primary {
+    @apply inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-primary-50 text-primary-600 text-xs font-medium border border-primary-200;
+  }
+
+  .badge-accent {
+    @apply inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-accent-50 text-accent-600 text-xs font-medium border border-accent-200;
+  }
+
+  .status-indicator {
+    @apply w-2 h-2 rounded-full animate-pulse-soft;
+  }
+
+  .status-online {
+    @apply status-indicator bg-primary-500;
+  }
+
+  .status-active {
+    @apply status-indicator bg-accent-500;
+  }
+
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(135deg, #085690, #ec6225);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(135deg, #064573, #bd4e1e);
+}
+
+/* Selection styling */
+::selection {
+  background: rgba(8, 86, 144, 0.2);
+  color: inherit;
+}
+
+/* Smooth transitions for all interactive elements */
+button, a, input, select, textarea {
+  transition: all 0.2s ease;
+}

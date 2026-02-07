@@ -1,0 +1,134 @@
+{
+  "checks": [
+    {
+      "category": "Row Count: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 1.0
+    },
+    {
+      "category": "Column Count: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.95
+    },
+    {
+      "category": "Datatype Match: newdb.employees",
+      "status": "Fail",
+      "errorDetails": "Column 'emp_id': Source type 'int' vs Target type 'bigint'",
+      "suggestedFix": "Review data type compatibility mapping",
+      "confidence": 0.65
+    },
+    {
+      "category": "Length/Size Match: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.9
+    },
+    {
+      "category": "Precision/Scale Check: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.9
+    },
+    {
+      "category": "Nullability Constraint Check: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.9
+    },
+    {
+      "category": "Primary Key Check: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.85
+    },
+    {
+      "category": "Foreign Key Check: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.85
+    },
+    {
+      "category": "Unique Keys: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.85
+    },
+    {
+      "category": "Index Comparison: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.85
+    },
+    {
+      "category": "Default Values: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.9
+    },
+    {
+      "category": "Encoding Check: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.8
+    },
+    {
+      "category": "View Definition Check: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.8
+    },
+    {
+      "category": "Stored Procedure/Object Count Check: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.8
+    },
+    {
+      "category": "Schema Name Mapping: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.85
+    },
+    {
+      "category": "Data Type Compatibility Rules: newdb.employees",
+      "status": "Pass",
+      "errorDetails": "",
+      "suggestedFix": "",
+      "confidence": 0.85
+    }
+  ],
+  "table_comparisons": [
+    {
+      "table": "newdb.employees",
+      "source_rows": 5,
+      "target_rows": 5,
+      "status": "Pass",
+      "accuracy": "100.0%"
+    }
+  ],
+  "summary": {
+    "total_tables": 1,
+    "tables_matched": 1,
+    "total_checks": 16,
+    "checks_passed": 15,
+    "checks_failed": 1,
+    "overall_accuracy": 100.0
+  },
+  "timestamp": "2025-12-19T04:55:02.966362"
+}

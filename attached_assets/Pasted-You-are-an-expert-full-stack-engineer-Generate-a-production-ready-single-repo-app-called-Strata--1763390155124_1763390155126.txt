@@ -1,0 +1,321 @@
+You are an expert full-stack engineer. Generate a production-ready, single-repo app called **Strata**: an AI-automated multi-database migration platform with four steps (Analyze ➜ Extract ➜ Migrate ➜ Reconcile) and a Settings → “Add Connection” flow, exactly matching the UX in the screenshots. Build everything end-to-end so it runs in Replit with one click.
+
+========================
+HIGH-LEVEL REQUIREMENTS
+========================
+• Four left-nav items (with step numbers & gradient pill highlight): 
+  1) Analyze, 2) Extract, 3) Migrate, 4) Reconcile. 
+• Top bar: app logo/title “Strata – Enterprise AI Translation Platform”, right side shows a green “Online” status dot, a settings (gear) icon, and a logout icon (no auth needed; just a button).
+• Clicking the gear opens a modal “Add Database Connection” with:
+  - Connection Name (text)
+  - Connection Type (fixed: “Source Database” for now)
+  - Database Type (dropdown) with EXACT items: PostgreSQL, MySQL, Snowflake, Databricks, Oracle, SQL Server, Teradata, Google BigQuery
+  - Dynamic credential form that changes 100% correctly per DB type (fields listed below)
+  - Buttons: [Test Connection] (async ping) and [Save Connection] (disabled until Test passes)
+• All saved connections are available globally in dropdowns across the app. 
+• Once a SourceDB and TargetDB are chosen in Analyze, they are **locked** for the rest of the run unless the user resets the session.
+
+========================
+TECH STACK
+========================
+• Frontend: React + Vite + TypeScript. TailwindCSS for styling. shadcn/ui components, lucide-react icons, framer-motion for subtle transitions. Clean, modern UI matching the screenshots (left rail steps, big content panel, cards, status tags).
+• Backend: Python FastAPI.
+• Background tasks: FastAPI BackgroundTasks.
+• Package management: requirements.txt for backend; package.json for frontend.
+• App storage: SQLite (for saved connections, run metadata, reports).
+• Encryption: Fernet symmetric encryption for stored DB credentials (ENV var FERNET_KEY; if not set, generate once & store to a local file).
+• OpenAI: Use environment var OPENAI_API_KEY; default model gpt-4o-mini (configurable).
+• Drivers/connectors (install where possible; gracefully fall back to “dry-run” stubs if a driver can’t install on Replit):
+  - PostgreSQL: psycopg2-binary
+  - MySQL: mysql-connector-python
+  - SQL Server: pyodbc (plus ODBC connection string), handle absence with stub
+  - Oracle: oracledb (thin mode), handle absence with stub
+  - Snowflake: snowflake-connector-python
+  - BigQuery: google-cloud-bigquery (use ADC JSON if provided), stub if missing
+  - Databricks: databricks-sql-connector
+  - Teradata: teradatasql (stub if missing)
+• SQL Introspection: Prefer INFORMATION_SCHEMA / system catalogs; fall back to dialect-specific queries when needed.
+• File export: 
+  - PDF via reportlab
+  - Excel via xlsxwriter
+  - JSON via standard lib
+• CORS enabled for local Vite dev.
+
+========================
+FRONTEND ROUTING & UI
+========================
+Single-page app with left nav:
+- Items:
+  (1) Analyze (default route “/”)
+  (2) Extract
+  (3) Migrate
+  (4) Reconcile
+Top bar: status pill “● Online”, gear button opens Settings → Add Connection modal.
+
+Modal: “Add Database Connection”
+- Fields:
+  Connection Name (text)
+  Database Type (select: PostgreSQL, MySQL, Snowflake, Databricks, Oracle, SQL Server, Teradata, Google BigQuery)
+  Dynamic credential form (see per-DB fields below)
+  Buttons: [Test Connection], [Save Connection] (disabled until test ok)
+- Show toast notifications for success/fail.
+
+Per-DB credential fields (render exactly based on selection):
+• PostgreSQL  → host, port, database, username, password, sslmode (disable/require)
+• MySQL       → host, port, database, username, password, ssl (true/false)
+• Snowflake   → account, user, password, role (optional), warehouse, database, schema
+• Databricks  → server_hostname, http_path, access_token, catalog (optional), schema (optional)
+• Oracle      → host, port, service_name, username, password
+• SQL Server  → host, port, database, username, password, driver (text; default “ODBC Driver 18 for SQL Server”)
+• Teradata    → host, username, password, database (optional)
+• BigQuery    → project_id, dataset (optional), credentials_json (multiline textarea for a service account JSON; allow empty to use ADC if available)
+Validate forms and hide irrelevant fields.
+
+Analyze Screen:
+- Two locked dropdowns side-by-side: Source DB, Target DB (options = saved, tested connections).
+- Once both selected, a “Start Analysis” button appears.
+- Running state shows a progress timeline with the categories below. When complete, show badge “AI analysis completed” and enable “Proceed to Extraction”.
+
+Extract Screen:
+- Read-only summary of Source/Target.
+- Button: “Run Extraction”. After completion, show object counts & enable “Proceed to Migration”.
+
+Migrate Screen:
+- Buttons (gated):
+  [Migrate Structure] (first)
+  → After success: [Migrate Data]
+  → After success: [Proceed to Validation]
+
+Reconcile Screen:
+- Validation controls; on run, show a table of checks with Status (Pass/Fail), Error Details, Suggested Fix, Confidence Score. 
+- Buttons to export Final Validation Report as PDF, JSON, XLSX.
+
+========================
+BACKEND API (FastAPI)
+========================
+Base path: /api
+Auth: none (local)
+Common response pattern: { ok: bool, message?: str, data?: any }
+
+Endpoints:
+• POST /connections/test
+  Body: { dbType, name, credentials }
+  → validates fields, attempts lightweight connect (or stub), returns { ok, vendorVersion, details }
+• POST /connections/save
+  Body: { dbType, name, credentials }
+  → encrypt & store; returns { ok, id }
+• GET /connections
+  → list all saved, redacting secrets
+• POST /session/set-source-target
+  Body: { sourceId, targetId }
+  → locks for this session in SQLite row “active_session”
+• GET /session
+  → returns current source/target summary
+• POST /analyze/start
+  → Background task to gather ALL required analysis artifacts (see “Analysis Scope” below). Poll with:
+• GET /analyze/status   → { ok, phase, percent, done, resultsSummary }
+• POST /extract/start
+• GET /extract/status
+• POST /migrate/structure
+• POST /migrate/data
+• POST /validate/run
+• GET /validate/report   → in-memory report JSON
+• GET /export/json       → file download of report.json
+• GET /export/xlsx       → file download of report.xlsx
+• GET /export/pdf        → file download of report.pdf
+• POST /reset            → clears active session & transient artifacts
+
+========================
+ANALYSIS SCOPE (MANDATORY)
+========================
+When /analyze/start is called, the backend must obtain the following from Source DB (use INFORMATION_SCHEMA or dialect catalogs; if a driver is unavailable, simulate with reasonable mock results but clearly mark “driver_unavailable: true” so the UI still flows).
+
+A) Database & Schema Analysis
+- database type, version, schemas, collations/encodings/locale, cross-schema dependencies, compatibility hints.
+
+B) Table Structure Analysis
+- tables, columns (name, type, length/precision/scale, default, nullable), PK/FK/UK/CK constraints, partitioning, temporary tables.
+
+C) Views
+- view names and SQL text; dependencies/nested views; non-standard functions detection.
+
+D) Stored Procedures, Functions, Triggers
+- names, types, languages/dialects (PL/pgSQL, T-SQL, PL/SQL, etc.), full source when available; incompatible syntax flags.
+
+E) Indexes & Performance
+- indexes (name, type, uniqueness, columns, include columns), missing/redundant suggestions; optimizer & cache settings snapshot.
+
+F) Relationships & Dependencies
+- FK graph with cascade rules; circular chains; relationship cardinality.
+
+G) Data Type Mapping Analysis
+- full inventory of used types; draft mapping (e.g., VARCHAR2→VARCHAR, NUMBER→DECIMAL).
+
+H) Security & Roles
+- users, roles, grants at schema/object level; role model compatibility notes.
+
+I) Environment & Config
+- OS, DB version/edition, driver info, cluster topology if any.
+
+J) Data Profiling
+- Per table: row counts, null ratios per column, distinct counts, avg length; basic quality flags.
+
+Return a normalized JSON “analysis_bundle.json” persisted in SQLite and on disk under /artifacts/<runId>/.
+
+========================
+EXTRACTION SCOPE (MANDATORY)
+========================
+On /extract/start, generate & store:
+A) DDL scripts for tables, views, indexes, constraints, sequences, triggers, routines.
+B) Constraint/relationship specs with dependency-ordered creation plan.
+C) Job/scheduler metadata (dbms_scheduler, Snowflake tasks, SQL Agent, etc.)
+D) Synonyms/aliases cross-refs.
+E) Data profile snapshot (min/max/histogram if cheaply available).
+F) Dependency graph JSON for object creation ordering.
+G) Source→Target type conversion preparation (initial rules).
+H) Performance/config snapshots (cache, stats).
+I) Security & roles export (users, grants).
+J) Extraction report (object counts, warnings) stored as JSON & human summary.
+
+========================
+MIGRATION FLOW
+========================
+• POST /migrate/structure
+  - Use analysis + extraction to produce target-dialect DDL. 
+  - Use two engines:
+    1) Deterministic mapper (Python rules) for common types & syntactic differences.
+    2) OpenAI function for edge cases: pass only schema/DDL snippets + source/target dialect labels; NEVER send credential secrets or data rows. Ask the model to output final DDL + notes. 
+  - Show resulting translation in the UI (read-only pane).
+  - Execute in target in dependency order; surface errors per object with retries/skip logic. End with “DB structure migration successfully done” if all created.
+
+• POST /migrate/data
+  - Chunked copy table-by-table with server-side queries and streaming where possible.
+  - Apply conversion rules (e.g., timezone normalize, numeric precision guards).
+  - Track counts, failures, and generate a per-table summary.
+
+========================
+VALIDATION SCOPE (MANDATORY)
+========================
+Run all of the following and build a final report with: Category, Status (Pass/Fail), Error Details, Suggested Fix (auto-generated), Confidence Score (0–1).
+
+1) STRUCTURAL
+  1.1 Schema Validation
+  1.2 Table Count & Structure Match (columns, types, precision, nullability)
+  1.3 Constraints (PK/FK/UK/NN/CK)
+  1.4 Views (text or semantic check)
+  1.5 Triggers active
+  1.6 Index presence & coverage
+  1.7 Stored procedures/functions compile + basic callability
+  1.8 Sequences values/step
+
+2) DATA
+  2.1 Row counts per table
+  2.2 Checksums/Hashes (MD5/SHA256) per table or chunk
+  2.3 Random sample row comparisons
+  2.4 Null ratios & distinct counts vs. source
+  2.5 Referential integrity (FKs consistent)
+  2.6 Data type conversion parity (no truncation/overflow)
+  2.7 Encoding & special chars preserved (UTF-8 etc.)
+  2.8 Date/Timezone correctness
+
+3) SECURITY
+  3.1 Users & Roles parity
+  3.2 Privileges (GRANT/REVOKE) parity
+  3.3 Ownership correct
+  3.4 Schema-level access parity
+
+4) PERFORMANCE & ENVIRONMENT
+  4.1 Baseline query performance comparison (simple SELECTs)
+  4.2 Index efficiency snapshot (explain plans if available)
+  4.3 Jobs/schedulers running
+  4.4 Storage & fragmentation snapshot
+  4.5 Version/locale/collation parity
+
+5) AI VALIDATION REPORTING
+  - Summarize results; include suggestions & auto-generated fixes. 
+  - Expose downloads:
+      GET /export/pdf    → pretty PDF
+      GET /export/json   → machine JSON
+      GET /export/xlsx   → Excel
+
+========================
+OPENAI USAGE (SERVER)
+========================
+• Create a module ai.py with helpers:
+  - translate_schema(source_dialect, target_dialect, input_ddl_json) 
+  - suggest_fixes(validation_failures_json)
+  - Use model = os.getenv("OPENAI_MODEL","gpt-4o-mini"). Temperature 0.1. 
+  - Privacy: NEVER send credentials or full data; send only schema/DDL fragments and metadata needed for translation.
+
+System prompt for translation:
+“You are an expert database migration engine. Convert supplied DDL from {source} to {target} with exact type mappings, constraints, indexes, sequences, triggers, and view definitions. Preserve semantics. Output strictly JSON: { 'objects': [ { 'name': str, 'kind': 'table'|'view'|'index'|'sequence'|'trigger'|'routine', 'target_sql': str, 'notes': str[] } ], 'warnings': str[] }”
+
+System prompt for validation fixes:
+“You are an expert DB reliability engineer. Given validation failures, propose precise fixes (SQL or config) with brief rationale.”
+
+========================
+DATA MODELS (SQLite)
+========================
+tables: 
+- connections(id pk, name, db_type, enc_credentials blob, created_at)
+- runs(id pk, created_at, source_id fk, target_id fk, status)
+- artifacts(id pk, run_id fk, kind text, path text, created_at)
+- validation_reports(id pk, run_id fk, json text, created_at)
+
+========================
+CREDENTIAL HANDLING
+========================
+• Store credentials as JSON → encrypt with Fernet before saving.
+• For test/connect: decrypt at runtime, build a connection string per driver.
+• Implement per-DB adapters in /adapters/ with a common interface:
+  - test_connection()
+  - introspect_analysis()
+  - extract_objects()
+  - create_objects(translated)
+  - copy_table_data()
+  - run_validation_checks()
+If a driver is unavailable, the adapter should respond with driver_unavailable=True and provide mock metadata so the UI flow remains testable.
+
+========================
+FRONTEND DETAILS
+========================
+• Build reusable components:
+  - ConnectionModal.tsx (dynamic form logic per DB type)
+  - DbSelect.tsx (lists saved connections)
+  - StepHeader.tsx (title, status chip)
+  - ProgressList.tsx (shows each analysis/extraction category with states: pending/running/done/fail)
+  - CodePane.tsx (read-only SQL preview with copy button)
+  - ReportTable.tsx (columns: Category, Status, Error, Suggested Fix, Confidence)
+• Match screenshot layout: large central card with “Conversion Mode” banner on Migrate, green “Ready to Convert” badge, etc. (style, not functionality, is important).
+
+========================
+RUN & SCRIPTS
+========================
+• Root run command: 
+  - Backend on port 8000 (uvicorn main:app --host 0.0.0.0 --port 8000)
+  - Frontend on port 5173; set VITE_API_BASE to backend URL.
+• Provide a Replit-ready entrypoint (Procfile or replit.nix) and README with quickstart:
+  1) Add OPENAI_API_KEY (and optional FERNET_KEY).
+  2) Click Run → starts both backend and frontend (use concurrently or two processes).
+
+========================
+QUALITY & EDGE CASES
+========================
+• Disable “Save Connection” until “Test Connection” returns ok:true.
+• Handle very large schemas by streaming results and paginating UI lists.
+• Show clear errors per object during structure migration and continue with next object.
+• Data migration uses chunk size env DATA_CHUNK_SIZE (default 10k rows).
+• If either adapter reports driver_unavailable, mark the run as “Simulated” but still allow translation, preview, and report export.
+• All APIs return deterministic shapes; all UI state has loading & error states.
+
+========================
+DELIVERABLES
+========================
+Generate the full repository:
+- /backend (FastAPI app, adapters per DB, ai.py, models.py, main.py, requirements.txt)
+- /frontend (Vite React TS, Tailwind, shadcn setup, pages for Analyze/Extract/Migrate/Reconcile, modal for Add Connection)
+- /artifacts (runtime)
+- README.md with setup steps and screenshots placeholders
+- Replit run config
+
+Implement everything now.
