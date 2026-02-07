@@ -1,8 +1,11 @@
 import os
 import json
+import asyncio
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
+import requests
 
 # Load env vars from both project root .env and backend/.env so AI creds are always picked up.
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -15,6 +18,24 @@ print(f"[AI MODULE] API Key from env: {'FOUND' if AI_INTEGRATIONS_OPENAI_API_KEY
 AI_INTEGRATIONS_OPENAI_BASE_URL = os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
 AI_INTEGRATIONS_OPENAI_MODEL = os.environ.get("AI_INTEGRATIONS_OPENAI_MODEL")
 print(f"[AI MODULE] Model from env: {AI_INTEGRATIONS_OPENAI_MODEL}")
+
+# Databricks serving endpoint support (used as primary translator when configured).
+DATABRICKS_LLM_INVOCATIONS_URL = os.environ.get(
+    "DATABRICKS_LLM_INVOCATIONS_URL",
+    "https://dbc-16797bba-8dc3.cloud.databricks.com/serving-endpoints/databricks-meta-llama-3-3-70b-instruct/invocations"
+)
+DATABRICKS_LLM_TOKEN = os.environ.get(
+    "DATABRICKS_LLM_TOKEN",
+    "dapidfb7f4cc9247d08997756ebe5969db77"
+)
+
+DATABRICKS_TIMEOUT_SECONDS = int(os.environ.get("DATABRICKS_LLM_TIMEOUT_SECONDS", "45"))
+DATABRICKS_MAX_RETRIES = int(os.environ.get("DATABRICKS_LLM_MAX_RETRIES", "3"))
+DATABRICKS_CIRCUIT_FAILURE_THRESHOLD = int(os.environ.get("DATABRICKS_LLM_CIRCUIT_FAILURE_THRESHOLD", "5"))
+DATABRICKS_CIRCUIT_OPEN_SECONDS = int(os.environ.get("DATABRICKS_LLM_CIRCUIT_OPEN_SECONDS", "90"))
+
+_databricks_failure_count = 0
+_databricks_circuit_open_until = 0.0
 
 client = None
 if AI_INTEGRATIONS_OPENAI_API_KEY:
@@ -35,15 +56,161 @@ else:
 model = AI_INTEGRATIONS_OPENAI_MODEL or "gpt-4o-mini"
 print(f"[AI MODULE] Using model: {model}")
 
+
+def _extract_llm_content(result_json: dict) -> str:
+    choices = result_json.get("choices") or []
+    if choices and isinstance(choices, list):
+        first = choices[0] or {}
+        message = first.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        # Some providers return content blocks.
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            if parts:
+                return "\n".join(parts)
+    # Fallback for raw text payloads
+    if isinstance(result_json.get("text"), str):
+        return result_json["text"]
+    return ""
+
+
+def _normalize_translation_result(result: dict, default_obj: dict) -> dict:
+    if not isinstance(result, dict):
+        raise ValueError("Translation result must be a JSON object")
+
+    objects = result.get("objects")
+    warnings = result.get("warnings", [])
+    if objects is None:
+        raise ValueError("Translation JSON missing 'objects'")
+    if not isinstance(objects, list):
+        raise ValueError("'objects' must be a list")
+    if not isinstance(warnings, list):
+        warnings = [str(warnings)]
+
+    normalized_objects = []
+    for idx, obj in enumerate(objects):
+        if not isinstance(obj, dict):
+            raise ValueError(f"Object at index {idx} must be a JSON object")
+        target_sql = obj.get("target_sql")
+        if not isinstance(target_sql, str):
+            raise ValueError(f"Object at index {idx} missing string 'target_sql'")
+        normalized_objects.append({
+            "name": str(obj.get("name") or default_obj.get("name") or f"object_{idx+1}"),
+            "kind": str(obj.get("kind") or default_obj.get("kind") or "table"),
+            "schema": obj.get("schema") if obj.get("schema") is not None else default_obj.get("schema"),
+            "target_sql": target_sql,
+            "notes": obj.get("notes") if isinstance(obj.get("notes"), list) else []
+        })
+
+    return {"objects": normalized_objects, "warnings": warnings}
+
+
+def _is_databricks_circuit_open() -> bool:
+    return time.monotonic() < _databricks_circuit_open_until
+
+
+def _record_databricks_success():
+    global _databricks_failure_count, _databricks_circuit_open_until
+    _databricks_failure_count = 0
+    _databricks_circuit_open_until = 0.0
+
+
+def _record_databricks_failure():
+    global _databricks_failure_count, _databricks_circuit_open_until
+    _databricks_failure_count += 1
+    if _databricks_failure_count >= DATABRICKS_CIRCUIT_FAILURE_THRESHOLD:
+        _databricks_circuit_open_until = time.monotonic() + DATABRICKS_CIRCUIT_OPEN_SECONDS
+        print(f"[AI] Databricks circuit opened for {DATABRICKS_CIRCUIT_OPEN_SECONDS}s")
+
+
+def _call_databricks_translation(system_prompt: str, input_ddl_json: dict) -> dict:
+    if not DATABRICKS_LLM_INVOCATIONS_URL or not DATABRICKS_LLM_TOKEN:
+        raise RuntimeError("Databricks LLM endpoint is not configured")
+
+    headers = {
+        "Authorization": f"Bearer {DATABRICKS_LLM_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Convert this schema:\n{json.dumps(input_ddl_json, indent=2)}"}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 8192
+    }
+
+    response = requests.post(
+        DATABRICKS_LLM_INVOCATIONS_URL,
+        headers=headers,
+        json=payload,
+        timeout=DATABRICKS_TIMEOUT_SECONDS
+    )
+    response.raise_for_status()
+    body = response.json()
+    content = _extract_llm_content(body).strip()
+    if not content:
+        raise RuntimeError("Databricks LLM returned empty response")
+
+    # Try strict JSON first.
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # If model wrapped JSON in code fences, strip and retry.
+    if "```" in content:
+        stripped = content.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return parsed
+
+    # If content is plain SQL, wrap into the expected translation shape.
+    objects = input_ddl_json.get("objects") or [{}]
+    first = objects[0] if objects else {}
+    return {
+        "objects": [
+            {
+                "name": first.get("name", "object"),
+                "kind": first.get("kind", "table"),
+                "schema": first.get("schema"),
+                "target_sql": content,
+                "notes": ["Translated by Databricks serving endpoint"]
+            }
+        ],
+        "warnings": []
+    }
+
+
+def _translate_with_databricks_retry(system_prompt: str, input_ddl_json: dict) -> dict:
+    if _is_databricks_circuit_open():
+        raise RuntimeError("Databricks circuit open due to repeated failures")
+
+    last_err = None
+    for attempt in range(1, DATABRICKS_MAX_RETRIES + 1):
+        try:
+            result = _call_databricks_translation(system_prompt, input_ddl_json)
+            default_obj = (input_ddl_json.get("objects") or [{}])[0]
+            normalized = _normalize_translation_result(result, default_obj)
+            _record_databricks_success()
+            return normalized
+        except Exception as e:
+            last_err = e
+            _record_databricks_failure()
+            if attempt < DATABRICKS_MAX_RETRIES:
+                delay = min(8, 2 ** (attempt - 1))
+                print(f"[AI] Databricks attempt {attempt} failed; retrying in {delay}s: {e}")
+                time.sleep(delay)
+    raise RuntimeError(f"Databricks translation failed after {DATABRICKS_MAX_RETRIES} attempts: {last_err}")
+
 async def translate_schema(source_dialect: str, target_dialect: str, input_ddl_json: dict) -> dict:
-    if not client:
-        print("[AI] Client not available for translation")
-        return {
-            "objects": [],
-            "warnings": ["OpenAI client not initialized. Using fallback translation."],
-            "error": "OpenAI client not available"
-        }
-    
     print(f"[AI] Attempting translation from {source_dialect} to {target_dialect}")
     print(f"[AI] Model being used: {model}")
     print(f"[AI] Number of objects to translate: {len(input_ddl_json.get('objects', []))}")
@@ -187,32 +354,42 @@ Output strictly valid JSON:
   "warnings": []
 }}"""
     
+    # 1) Primary path: Databricks serving endpoint (applies across all source dialects).
     try:
-        print("[AI] Making API call to OpenAI")
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Convert this schema:\n{json.dumps(input_ddl_json, indent=2)}"}
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"}
-        )
-        print("[AI] API call successful")
-        
-        result = json.loads(response.choices[0].message.content)
-        print(f"[AI] Parsed result with {len(result.get('objects', []))} objects")
+        print("[AI] Making API call to Databricks serving endpoint")
+        result = await asyncio.to_thread(_translate_with_databricks_retry, system_prompt, input_ddl_json)
+        print(f"[AI] Databricks translation successful with {len(result.get('objects', []))} objects")
         return result
-    except Exception as e:
-        print(f"[AI] Translation error: {str(e)}")
-        print(f"[AI] Error type: {type(e).__name__}")
-        import traceback
-        print(f"[AI] Full traceback: {traceback.format_exc()}")
-        return {
-            "objects": [],
-            "warnings": [f"AI translation error: {str(e)}. Using fallback translation."],
-            "error": str(e)
-        }
+    except Exception as databricks_error:
+        print(f"[AI] Databricks translation error: {databricks_error}")
+
+    # 2) Secondary path: existing OpenAI client if configured.
+    if client:
+        try:
+            print("[AI] Making API call to OpenAI")
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Convert this schema:\n{json.dumps(input_ddl_json, indent=2)}"}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            print("[AI] API call successful")
+
+            result = json.loads(response.choices[0].message.content)
+            print(f"[AI] Parsed result with {len(result.get('objects', []))} objects")
+            return result
+        except Exception as e:
+            print(f"[AI] OpenAI translation error: {str(e)}")
+
+    # 3) Final path: explicit error marker so caller can fallback_translation.
+    return {
+        "objects": [],
+        "warnings": ["LLM translation unavailable. Using fallback translation."],
+        "error": "Databricks and OpenAI translation paths failed"
+    }
 
 async def suggest_fixes(validation_failures_json: dict) -> dict:
     if not client:

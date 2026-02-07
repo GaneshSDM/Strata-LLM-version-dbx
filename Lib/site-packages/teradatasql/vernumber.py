@@ -1,0 +1,3 @@
+# Copyright 2026 by Teradata Corporation. All rights reserved.
+
+sVersionNumber = "20.0.0.50"

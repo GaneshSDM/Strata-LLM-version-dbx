@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, FileText, FileSpreadsheet, FileJson, Database, Table, Eye, Zap, Hash, Box, Lock, Code, ArrowRight } from 'lucide-react'
+import { ArrowLeft, FileText, FileSpreadsheet, FileJson, Database, Table, Eye, Zap, Hash, Box, Lock, Code } from 'lucide-react'
 import { useWizard } from '../components/WizardContext'
 import { ensureSessionId, getSessionHeaders } from '../utils/session'
 
@@ -454,7 +454,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
                   </div>
                   <div className="mt-6 p-4 bg-blue-50 border-l-4 border-[#085690] rounded">
                     <p className="text-sm text-gray-700">
-                      <strong>Next Step:</strong> Click "Proceed to Migration" to translate these DDL scripts to your target database dialect using AI.
+                      <strong>Next Step:</strong> Open logs to monitor connector activity and backend execution details.
                     </p>
                   </div>
                 </div>
@@ -782,12 +782,11 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
             <button
               onClick={() => {
                 onExtractionComplete()
-                navigate('/migrate')
+                navigate('/logs')
               }}
               className="flex items-center gap-2 px-8 py-3 bg-gradient-to-r from-[#ec6225] to-[#ff7a3d] text-white rounded-lg hover:shadow-lg transition-all font-medium text-lg"
             >
-              Proceed to Migration
-              <ArrowRight size={20} />
+              Open Logs
             </button>
           </div>
         </>
@@ -833,7 +832,6 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     </div>
   )
 }
-
 
 
 

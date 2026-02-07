@@ -481,7 +481,9 @@ def _sanitize_credentials(db_type: str, credentials: Any) -> Dict[str, Any]:
     if not isinstance(credentials, dict):
         return {}
 
-    if (db_type or "").strip().lower() == "oracle":
+    kind = (db_type or "").strip().lower()
+
+    if kind == "oracle":
         allowed = {"host", "port", "service_name", "username", "password", "schema"}
         cleaned: Dict[str, Any] = {k: credentials.get(k) for k in allowed if k in credentials}
 
@@ -492,6 +494,39 @@ def _sanitize_credentials(db_type: str, credentials: Any) -> Dict[str, Any]:
             cleaned["schema"] = credentials.get("schema_name")
 
         return cleaned
+
+    if kind == "databricks":
+        cleaned = {
+            "server_hostname": credentials.get("server_hostname") or credentials.get("host"),
+            "http_path": credentials.get("http_path") or credentials.get("httpPath"),
+            "access_token": credentials.get("access_token") or credentials.get("accessToken"),
+            "catalog": credentials.get("catalog"),
+            "schema": credentials.get("schema")
+        }
+        return {k: v for k, v in cleaned.items() if v is not None}
+
+    if kind == "snowflake":
+        cleaned = {
+            "account": credentials.get("account"),
+            "username": credentials.get("username") or credentials.get("user"),
+            "password": credentials.get("password"),
+            "warehouse": credentials.get("warehouse"),
+            "database": credentials.get("database") or credentials.get("db"),
+            "schema": credentials.get("schema"),
+            "role": credentials.get("role")
+        }
+        return {k: v for k, v in cleaned.items() if v is not None}
+
+    if kind == "mysql":
+        cleaned = {
+            "host": credentials.get("host"),
+            "port": credentials.get("port"),
+            "database": credentials.get("database") or credentials.get("db"),
+            "username": credentials.get("username") or credentials.get("user"),
+            "password": credentials.get("password"),
+            "ssl": credentials.get("ssl")
+        }
+        return {k: v for k, v in cleaned.items() if v is not None}
 
     return credentials
 
@@ -505,6 +540,10 @@ class ConvertDdlRequest(BaseModel):
     sourceDdl: Optional[str] = None
     objectName: Optional[str] = None
     objectKind: Optional[str] = None
+
+
+MAX_DDL_CONVERT_BYTES = 300_000
+MAX_DDL_CONVERT_OBJECT_NAME = 255
 
 async def ensure_db_ready():
     """Wait for database to be ready - for API endpoints that need it"""
@@ -528,8 +567,10 @@ async def ensure_db_ready():
         raise HTTPException(status_code=503, detail="Database not ready")
 
 @app.post("/api/connections/test")
-async def test_connection(req: TestConnectionRequest):
+async def test_connection(req: TestConnectionRequest, request: Request):
     try:
+        session_id = _get_request_session_id(request)
+        _log_event("CONNECTION", f"Testing connection db_type={req.dbType}", session_id=session_id)
         credentials = _sanitize_credentials(req.dbType, req.credentials)
         adapter = get_adapter(req.dbType, credentials)
         result = await adapter.test_connection()
@@ -539,6 +580,11 @@ async def test_connection(req: TestConnectionRequest):
             result["message"] = details if isinstance(details, str) and details.strip() else "Connection successful"
         if isinstance(result, dict) and result.get("ok") is False and not result.get("message"):
             result["message"] = "Connection failed"
+        _log_event(
+            "CONNECTION",
+            f"Connection test completed db_type={req.dbType} ok={bool(isinstance(result, dict) and result.get('ok'))}",
+            session_id=session_id
+        )
         return result
     except Exception as e:
         import traceback
@@ -546,17 +592,22 @@ async def test_connection(req: TestConnectionRequest):
         message = str(e).strip()
         if not message:
             message = f"{e.__class__.__name__}"
+        _log_event("CONNECTION", f"Connection test failed db_type={req.dbType}: {message}", session_id=_get_request_session_id(request), level="error")
         return {"ok": False, "message": message}
 
 @app.post("/api/connections/save")
-async def save_connection(req: SaveConnectionRequest):
+async def save_connection(req: SaveConnectionRequest, request: Request):
     await ensure_db_ready()
     try:
+        session_id = _get_request_session_id(request)
+        _log_event("CONNECTION", f"Saving connection name={req.name} db_type={req.dbType}", session_id=session_id)
         credentials = _sanitize_credentials(req.dbType, req.credentials)
         enc_creds = encrypt_credentials(credentials)
         conn_id = await ConnectionModel.create(req.name, req.dbType, enc_creds)
+        _log_event("CONNECTION", f"Saved connection id={conn_id} db_type={req.dbType}", session_id=session_id)
         return {"ok": True, "id": conn_id, "message": "Connection saved successfully"}
     except Exception as e:
+        _log_event("CONNECTION", f"Save connection failed name={req.name}: {e}", session_id=_get_request_session_id(request), level="error")
         return {"ok": False, "message": str(e)}
 
 @app.get("/api/connections")
@@ -923,7 +974,7 @@ async def set_session(req: SetSessionRequest, request: Request):
         return {"ok": False, "message": str(e)}
 
 @app.post("/api/ddl/convert")
-async def convert_ddl(req: ConvertDdlRequest):
+async def convert_ddl(req: ConvertDdlRequest, request: Request):
     """Convert a single DDL statement using AI with a hard timeout and fast fallback.
 
     This endpoint is used by the UI for ad-hoc DDL conversion. Previously, if the
@@ -939,36 +990,47 @@ async def convert_ddl(req: ConvertDdlRequest):
     try:
         if not req.sourceDdl:
             return {"ok": False, "message": "sourceDdl is required"}
+        if len(req.sourceDdl.encode("utf-8")) > MAX_DDL_CONVERT_BYTES:
+            return {"ok": False, "message": f"sourceDdl too large (max {MAX_DDL_CONVERT_BYTES} bytes)"}
+        if req.objectName and len(req.objectName) > MAX_DDL_CONVERT_OBJECT_NAME:
+            return {"ok": False, "message": f"objectName too long (max {MAX_DDL_CONVERT_OBJECT_NAME} chars)"}
 
         ai = _import_ai_module()
+        session_id = _get_request_session_id(request)
+        run_id = await _ensure_session_run_id(session_id)
+        _log_event(
+            "DDL",
+            f"Convert requested source={req.sourceDialect or 'unknown'} target={req.targetDialect or 'unknown'} bytes={len(req.sourceDdl.encode('utf-8'))}",
+            run_id=run_id,
+            session_id=session_id
+        )
         obj = {
             "name": req.objectName or "object",
             "kind": req.objectKind or "table",
             "source_ddl": req.sourceDdl or "",
         }
 
-        # Hard timeout for AI translation so the request never hangs indefinitely.
-        ai_timeout_seconds = 30
+        # Hard timeout for translation so the request never hangs indefinitely.
+        ai_timeout_seconds = 45
         translation = None
-        force_fallback = "databricks" in (req.targetDialect or "").lower()
-
-        if not force_fallback:
-            try:
-                translation = await asyncio.wait_for(
-                    ai.translate_schema(
-                        req.sourceDialect or "",
-                        req.targetDialect or "",
-                        {"objects": [obj]},
-                    ),
-                    timeout=ai_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"/api/ddl/convert timed out after {ai_timeout_seconds}s; falling back to rule-based translation"
-                )
-            except Exception as e:
-                # Log but continue to fallback so the UI still receives a response.
-                logger.error(f"/api/ddl/convert AI error: {e}")
+        try:
+            translation = await asyncio.wait_for(
+                ai.translate_schema(
+                    req.sourceDialect or "",
+                    req.targetDialect or "",
+                    {"objects": [obj]},
+                ),
+                timeout=ai_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"/api/ddl/convert timed out after {ai_timeout_seconds}s; falling back to rule-based translation"
+            )
+            _log_event("DDL", f"Convert timeout after {ai_timeout_seconds}s; using fallback", run_id=run_id, session_id=session_id, level="warning")
+        except Exception as e:
+            # Log but continue to fallback so the UI still receives a response.
+            logger.error(f"/api/ddl/convert AI error: {e}")
+            _log_event("DDL", f"Convert AI error; using fallback: {e}", run_id=run_id, session_id=session_id, level="warning")
 
         if not isinstance(translation, dict) or not translation.get("objects"):
             translation = ai.fallback_translation(
@@ -976,13 +1038,21 @@ async def convert_ddl(req: ConvertDdlRequest):
             )
 
         translated = (translation.get("objects") or [{}])[0]
-        return {
+        response = {
             "ok": True,
             "target_sql": translated.get("target_sql", ""),
             "notes": translated.get("notes", []),
         }
+        _log_event(
+            "DDL",
+            f"Convert completed source={req.sourceDialect or 'unknown'} target={req.targetDialect or 'unknown'} sql_chars={len(response.get('target_sql', ''))}",
+            run_id=run_id,
+            session_id=session_id
+        )
+        return response
     except Exception as e:
         logger.error(f"/api/ddl/convert unexpected error: {e}")
+        _log_event("DDL", f"Convert failed: {e}", session_id=_get_request_session_id(request), level="error")
         return {"ok": False, "message": str(e)}
 
 @app.get("/api/session")

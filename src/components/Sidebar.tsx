@@ -1,4 +1,4 @@
-import { Search, Download, ArrowRightLeft, CheckCircle2, Database, Zap, Clock3, Cpu, Terminal } from 'lucide-react';
+import { Search, Download, Database, Zap, Terminal } from 'lucide-react';
 import { Link, useLocation } from 'react-router-dom';
 import strataLogo from '../assets/image (1)_1763392280085.png';
 import { StageProgress } from '../types/workflow';
@@ -21,38 +21,10 @@ const navigationItems = [
   },
   {
     id: 3,
-    title: 'Migrate',
-    description: 'Query conversion and migration',
-    icon: ArrowRightLeft,
-    path: '/migrate',
-  },
-  {
-    id: 4,
-    title: 'Reconcile',
-    description: 'Validation and testing',
-    icon: CheckCircle2,
-    path: '/reconcile',
-  },
-  {
-    id: 5,
-    title: 'Migration History',
-    description: 'Live migration records',
-    icon: Clock3,
-    path: '/history',
-  },
-  {
-    id: 6,
     title: 'View Logs',
     description: 'Session log feed',
     icon: Terminal,
     path: '/logs',
-  },
-  {
-    id: 7,
-    title: 'Databricks Add-on',
-    description: 'Oracle to Databricks DDL',
-    icon: Cpu,
-    path: '/databricks-addon',
   },
 ];
 
@@ -67,32 +39,6 @@ const getAccessMessage = (path: string, progress: StageProgress) => {
       return {
         allowed: progress.analysis,
         message: 'Complete the analysis step to unlock extraction.'
-      };
-    case '/migrate':
-      return {
-        allowed: progress.analysis && progress.extraction,
-        message: progress.analysis
-          ? 'Finish extraction before starting migration.'
-          : 'Complete the analysis step first.'
-      };
-    case '/reconcile':
-      return {
-        allowed: progress.analysis && progress.extraction && progress.migration,
-        message: progress.migration
-          ? ''
-          : progress.analysis && progress.extraction
-            ? 'Finish migration before starting reconciliation.'
-            : 'Complete analysis, extraction, and migration before reconciliation.'
-      };
-    case '/history':
-      return {
-        allowed: true,
-        message: ''
-      };
-    case '/databricks-addon':
-      return {
-        allowed: true,
-        message: ''
       };
     case '/logs':
       return {

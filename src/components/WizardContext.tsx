@@ -1,6 +1,6 @@
 import { createContext, useContext, type ReactNode } from 'react'
 
-export type WizardStepPath = '/' | '/extract' | '/migrate' | '/reconcile'
+export type WizardStepPath = '/' | '/extract'
 
 export type WizardContextValue = {
   lastWizardPath: WizardStepPath

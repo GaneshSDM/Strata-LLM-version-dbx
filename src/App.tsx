@@ -4,10 +4,6 @@ import Layout from './components/Layout'
 import Login from './pages/Login'
 import Analyze from './pages/Analyze'
 import Extract from './pages/Extract'
-import Migrate from './pages/Migrate'
-import Reconcile from './pages/Reconcile'
-import MigrationHistory from './pages/MigrationHistory'
-import DatabricksAddon from './pages/DatabricksAddon'
 import ViewLogs from './pages/ViewLogs'
 import { LogsModal } from './components/LogsModal'
 import { ConnectionModal } from './components/ConnectionModal'
@@ -42,14 +38,14 @@ const getStoredStageProgress = (): StageProgress => {
   }
 }
 
-const WIZARD_PATHS: WizardStepPath[] = ['/', '/extract', '/migrate', '/reconcile']
+const WIZARD_PATHS: WizardStepPath[] = ['/', '/extract']
 
 const isWizardPath = (path: string): path is WizardStepPath => {
   return (WIZARD_PATHS as string[]).includes(path)
 }
 
 const isKnownPath = (path: string) => {
-  return isWizardPath(path) || path === '/history' || path === '/databricks-addon' || path === '/logs'
+  return isWizardPath(path) || path === '/logs'
 }
 
 // Error Boundary Component
@@ -108,16 +104,12 @@ function AuthenticatedContent({
   stageProgress,
   resetWorkflowStages,
   markStageComplete,
-  setShowLogsModal,
-  lastWizardPath,
   setLastWizardPath
 }: {
   connections: Connection[]
   stageProgress: StageProgress
   resetWorkflowStages: () => void
   markStageComplete: (stage: StageKey) => void
-  setShowLogsModal: (show: boolean) => void
-  lastWizardPath: WizardStepPath
   setLastWizardPath: (path: WizardStepPath) => void
 }) {
   const location = useLocation()
@@ -158,35 +150,6 @@ function AuthenticatedContent({
           />
         )}
       </div>
-
-      <div hidden={pathname !== '/migrate'}>
-        {stageProgress.analysis && stageProgress.extraction ? (
-          <Migrate onMigrationComplete={() => markStageComplete('migration')} />
-        ) : (
-          <LockedStage
-            title="Migration Locked"
-            message="Complete analysis and extraction steps to unlock migration."
-            actionLabel={stageProgress.analysis ? 'Go to Extraction' : 'Go to Analysis'}
-            actionPath={stageProgress.analysis ? '/extract' : '/'}
-          />
-        )}
-      </div>
-
-      <div hidden={pathname !== '/reconcile'}>
-        {stageProgress.analysis && stageProgress.extraction && stageProgress.migration ? (
-          <Reconcile setShowLogsModal={setShowLogsModal} />
-        ) : (
-          <LockedStage
-            title="Reconciliation Locked"
-            message="Finish migration before running reconciliation."
-            actionLabel={stageProgress.analysis && stageProgress.extraction ? 'Go to Migration' : 'Go to Analysis'}
-            actionPath={stageProgress.analysis && stageProgress.extraction ? '/migrate' : '/'}
-          />
-        )}
-      </div>
-
-      {pathname === '/history' && <MigrationHistory lastWizardPath={lastWizardPath} />}
-      {pathname === '/databricks-addon' && <DatabricksAddon />}
       {pathname === '/logs' && <ViewLogs />}
     </>
   )
@@ -344,8 +307,6 @@ function App() {
               stageProgress={stageProgress}
               resetWorkflowStages={resetWorkflowStages}
               markStageComplete={markStageComplete}
-              setShowLogsModal={setShowLogsModal}
-              lastWizardPath={lastWizardPath}
               setLastWizardPath={setLastWizardPath}
             />
           </Layout>

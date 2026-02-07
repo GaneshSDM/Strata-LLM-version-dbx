@@ -9,15 +9,10 @@ import PostgresqlIcon from '../assets/Postgresql.png'
 import SnowflakeIcon from '../assets/Snowflake.png'
 
 const DB_TYPES = [
-  'PostgreSQL',
   'MySQL',
   'Snowflake',
   'Databricks',
-  'Oracle',
-  'SQL Server',
-  'Teradata',
-  'Google BigQuery',
-  'AWS S3'
+  'Oracle'
 ]
 
 type Connection = {
@@ -88,7 +83,7 @@ export function ConnectionModal({ onClose, onSaved }: Props) {
   const [showConnectionNameModal, setShowConnectionNameModal] = useState(false)
   const [pendingFile, setPendingFile] = useState<File | null>(null)
   const [connectionNameInput, setConnectionNameInput] = useState('')
-  const [uploadTemplateType, setUploadTemplateType] = useState<'MySQL' | 'PostgreSQL' | 'Snowflake' | 'Databricks'>('MySQL')
+  const [uploadTemplateType, setUploadTemplateType] = useState<'MySQL' | 'Snowflake' | 'Databricks' | 'Oracle'>('MySQL')
   const successTimeoutRef = useRef<number | null>(null)
 
   useEffect(() => {
@@ -156,13 +151,6 @@ username:
 password:
 database:
 ssl: true`,
-    PostgreSQL: `database type: PostgreSQL
-host:
-port:
-username:
-password:
-database:
-sslmode: require`,
     Snowflake: `database type: Snowflake
 account:
 user:
@@ -175,6 +163,13 @@ server hostname:
 http path:
 access token:
 catalog:
+schema:`,
+    Oracle: `database type: Oracle
+host:
+port:
+service name:
+username:
+password:
 schema:`
   }
 
@@ -555,7 +550,7 @@ schema:`
         
         <div className="grid grid-cols-[160px,1fr] gap-4 mb-6">
           <div className="space-y-2">
-            {(['MySQL','PostgreSQL','Snowflake','Databricks'] as const).map(type => (
+            {(['MySQL','Snowflake','Databricks','Oracle'] as const).map(type => (
               <button
                 key={type}
                 onClick={() => setUploadTemplateType(type)}
