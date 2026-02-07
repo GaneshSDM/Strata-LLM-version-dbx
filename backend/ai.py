@@ -6,6 +6,13 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 import requests
+from cryptography.fernet import Fernet
+try:
+    # Prefer package-relative import when used as part of the backend package
+    from .encryption import get_fernet_key
+except Exception:
+    # Fallback for direct execution contexts
+    from backend.encryption import get_fernet_key  # type: ignore
 
 # Load env vars from both project root .env and backend/.env so AI creds are always picked up.
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -24,10 +31,25 @@ DATABRICKS_LLM_INVOCATIONS_URL = os.environ.get(
     "DATABRICKS_LLM_INVOCATIONS_URL",
     "https://dbc-16797bba-8dc3.cloud.databricks.com/serving-endpoints/databricks-meta-llama-3-3-70b-instruct/invocations"
 )
-DATABRICKS_LLM_TOKEN = os.environ.get(
-    "DATABRICKS_LLM_TOKEN",
-    "dapidfb7f4cc9247d08997756ebe5969db77"
-)
+
+def _get_databricks_token() -> str | None:
+    # 1) Prefer explicit plaintext env if set (e.g., injected at runtime by secret manager)
+    plain = os.environ.get("DATABRICKS_LLM_TOKEN")
+    if plain:
+        return plain
+
+    # 2) Otherwise attempt to decrypt encrypted env
+    enc = os.environ.get("DATABRICKS_LLM_TOKEN_ENC")
+    if enc:
+        try:
+            f = Fernet(get_fernet_key())
+            return f.decrypt(enc.encode()).decode()
+        except Exception as e:
+            print(f"[AI MODULE] Warning: Failed to decrypt DATABRICKS_LLM_TOKEN_ENC: {e}")
+            return None
+    return None
+
+DATABRICKS_LLM_TOKEN = _get_databricks_token()
 
 DATABRICKS_TIMEOUT_SECONDS = int(os.environ.get("DATABRICKS_LLM_TIMEOUT_SECONDS", "45"))
 DATABRICKS_MAX_RETRIES = int(os.environ.get("DATABRICKS_LLM_MAX_RETRIES", "3"))
