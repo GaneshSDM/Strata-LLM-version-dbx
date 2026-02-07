@@ -18,6 +18,8 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
   const [activeDdl, setActiveDdl] = useState<{ title: string; ddl: string; cacheKey: string } | null>(null)
   const [targetDdlCache, setTargetDdlCache] = useState<Record<string, { ddl: string; loading: boolean; error?: string }>>({})
   const [sessionInfo, setSessionInfo] = useState<{ sourceType?: string; targetType?: string } | null>(null)
+  // New UI flag – when true we ask the backend to execute the translated DDL in the target DB.
+  const [runInTarget, setRunInTarget] = useState<boolean>(false)
 
   const startExtraction = async () => {
     await ensureSessionId()
@@ -113,15 +115,30 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
           targetDialect: sessionInfo?.targetType || 'Databricks',
           sourceDdl: params.sourceDdl,
           objectName: params.name || params.cacheKey,
-          objectKind: params.kind
+          objectKind: params.kind,
+          // Pass the execution flag – backend will run the DDL if true.
+          execute: runInTarget
         })
       })
       const data = await parseJsonResponse(res)
-      if (data.ok) {
-        setTargetDdlCache(prev => ({ ...prev, [params.cacheKey]: { ddl: data.target_sql || '', loading: false } }))
-      } else {
-        setTargetDdlCache(prev => ({ ...prev, [params.cacheKey]: { ddl: '', loading: false, error: data.message || 'Conversion failed' } }))
-      }
+        if (data.ok) {
+          // Preserve execution status in the cache for UI display.
+          const execInfo = {
+            executed: data.executed ?? false,
+            execution_error: data.execution_error ?? null
+          }
+          setTargetDdlCache(prev => ({
+            ...prev,
+            [params.cacheKey]: {
+              ddl: data.target_sql || '',
+              loading: false,
+              // Attach execution info as optional fields (will be read elsewhere).
+              ...execInfo
+            }
+          }))
+        } else {
+          setTargetDdlCache(prev => ({ ...prev, [params.cacheKey]: { ddl: '', loading: false, error: data.message || 'Conversion failed' } }))
+        }
     } catch (err: any) {
       setTargetDdlCache(prev => ({ ...prev, [params.cacheKey]: { ddl: '', loading: false, error: err?.message || 'Conversion failed' } }))
     }
@@ -778,7 +795,17 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
             </div>
           </div>
 
-          <div className="mt-6 flex justify-center">
+          <div className="mt-6 flex flex-col items-center space-y-4">
+            {/* New checkbox to request execution of translated DDL */}
+            <label className="flex items-center gap-2 text-sm text-gray-700">
+              <input
+                type="checkbox"
+                checked={runInTarget}
+                onChange={e => setRunInTarget(e.target.checked)}
+                className="form-checkbox h-4 w-4 text-blue-600"
+              />
+              Run translated DDL in target database
+            </label>
             <button
               onClick={() => {
                 onExtractionComplete()
@@ -824,6 +851,18 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
                       ? targetDdlCache[activeDdl.cacheKey]?.error
                       : targetDdlCache[activeDdl.cacheKey]?.ddl || 'Target DDL unavailable'}
                 </pre>
+                {/* Show execution outcome if the backend attempted to run the DDL */}
+                {targetDdlCache[activeDdl.cacheKey]?.executed !== undefined && (
+                  <div className="mt-2 text-sm">
+                    {targetDdlCache[activeDdl.cacheKey]?.executed ? (
+                      <span className="text-green-600 font-medium">✅ Executed in target</span>
+                    ) : (
+                      <span className="text-red-600 font-medium">
+                        ❌ Execution failed: {targetDdlCache[activeDdl.cacheKey]?.execution_error || 'unknown error'}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -832,9 +871,6 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     </div>
   )
 }
-
-
-
 
 
 

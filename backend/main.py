@@ -540,6 +540,8 @@ class ConvertDdlRequest(BaseModel):
     sourceDdl: Optional[str] = None
     objectName: Optional[str] = None
     objectKind: Optional[str] = None
+    # New flag – when true the backend will attempt to run the translated DDL in the target DB.
+    execute: Optional[bool] = False
 
 
 MAX_DDL_CONVERT_BYTES = 300_000
@@ -1043,6 +1045,29 @@ async def convert_ddl(req: ConvertDdlRequest, request: Request):
             "target_sql": translated.get("target_sql", ""),
             "notes": translated.get("notes", []),
         }
+
+        # ------------------------------------------------------------
+        # Optional execution of the translated DDL in the target DB.
+        # ------------------------------------------------------------
+        if getattr(req, "execute", False):
+            # Resolve the target connection from the current session.
+            session = await SessionModel.get_session()
+            target_id = session.get("target_id") if session else None
+            if target_id:
+                target_conn = await ConnectionModel.get_by_id(target_id)
+                if target_conn:
+                    target_credentials = decrypt_credentials(target_conn["enc_credentials"])
+                    target_adapter = get_adapter(target_conn["db_type"], target_credentials)
+                    exec_res = await target_adapter.run_ddl(response["target_sql"])
+                    response["executed"] = exec_res.get("ok", False)
+                    response["execution_error"] = exec_res.get("error")
+                else:
+                    response["executed"] = False
+                    response["execution_error"] = "Target connection not found"
+            else:
+                response["executed"] = False
+                response["execution_error"] = "No target configured in session"
+
         _log_event(
             "DDL",
             f"Convert completed source={req.sourceDialect or 'unknown'} target={req.targetDialect or 'unknown'} sql_chars={len(response.get('target_sql', ''))}",

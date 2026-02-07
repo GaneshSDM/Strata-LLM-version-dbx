@@ -1180,6 +1180,27 @@ class DatabricksAdapter(DatabaseAdapter):
         # For now, we'll return a placeholder
         return {"structural": {"schema_match": True}, "data": {"row_counts_match": True}}
 
+    async def run_ddl(self, ddl: str) -> Dict[str, Any]:
+        """Execute arbitrary DDL against Databricks.
+
+        Splits the SQL string on semicolons and runs each statement using the
+        Databricks connector. Commits on success and returns ``{"ok": True}``.
+        On failure returns ``{"ok": False, "error": "msg"}``.
+        """
+        if not self.driver_available:
+            return {"ok": False, "error": "Databricks driver unavailable"}
+        try:
+            connection = self.get_connection()
+            cursor = connection.cursor()
+            for stmt in filter(None, (s.strip() for s in ddl.split(';'))):
+                cursor.execute(stmt)
+            connection.commit()
+            cursor.close()
+            connection.close()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     async def rename_column(self, table_name: str, old_column_name: str, new_column_name: str) -> Dict[str, Any]:
         """Rename a column in Databricks using ALTER TABLE ... RENAME COLUMN ... TO ..."""
         if not self.driver_available:

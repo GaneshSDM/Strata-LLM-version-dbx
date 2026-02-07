@@ -1773,10 +1773,31 @@ class SnowflakeAdapter(DatabaseAdapter):
                             break
                     except Exception:
                         continue
-                return cols
+        return cols
             finally:
                 cur.close()
                 conn.close()
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, list_sync)
+
+    async def run_ddl(self, ddl: str) -> dict:
+        """Execute arbitrary DDL against Snowflake.
+
+        Splits the supplied SQL on semicolons, runs each statement
+        sequentially, commits, and returns ``{"ok": True}`` on success.
+        On failure returns ``{"ok": False, "error": "msg"}``.
+        """
+        if not self.driver_available:
+            return {"ok": False, "error": "Snowflake driver not available"}
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            for stmt in filter(None, (s.strip() for s in ddl.split(';'))):
+                cur.execute(stmt)
+            conn.commit()
+            cur.close()
+            conn.close()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
