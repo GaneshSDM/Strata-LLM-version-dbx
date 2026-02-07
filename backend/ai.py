@@ -216,115 +216,73 @@ async def translate_schema(source_dialect: str, target_dialect: str, input_ddl_j
     print(f"[AI] Number of objects to translate: {len(input_ddl_json.get('objects', []))}")
     
     if "databricks" in (target_dialect or "").lower():
-        system_prompt = """You are a database migration expert. Convert oracle DDL into Databricks SQL.
+        # NOTE: This prompt is intentionally derived from the user's enterprise DDL conversion rubric.
+        # We adapt it to this backend by:
+        #   - taking input as JSON objects (each with source_ddl)
+        #   - requiring output as JSON (objects[].target_sql) so the UI can display it reliably
+        system_prompt = """You are a database migration expert.
 
-   interactive:
-  sql:
-    sql_script: 
-      You are a database migration expert. Convert **Oracle SQL** into
-      Databricks-compatible **Databricks SQL** (SQL-only).
-      
-      Output:
-        - Return **Databricks SQL only**, each statement ends with a semicolon.
-        - [MANDATORY] Do NOT wrap it in backticks, code fences, or a language tag.
-        - [MANDATORY] NEVER use IDENTIFIER() function - always use backtick-quoted table names like `table_name`
-        - [MANDATORY] Convert schema-qualified names like "schema"."table" to simple backtick names like `table`
-      
-      Key conversion considerations:
-        - Remove or correct double quotes (`"Column"`)
-        - [MANDATORY] NEVER use IDENTIFIER() function in output - this is for notebooks only
-        - [MANDATORY] Convert schema-qualified table names to simple backtick names
-        - [MANDATORY] If the source is NUMBER with no precision and no scale (e.g., NUMBER), always convert to INT.
-        - [MANDATORY] If the source is NUMBER(p) with no scale (e.g., NUMBER(10)), always convert to DECIMAL(p).
-        - [MANDATORY] If the source is NUMBER(p, s) with a scale (e.g., NUMBER(10,2)), always convert to DECIMAL(p, s).
-        - [MANDATORY] Map Oracle NUMBER (with no precision and no scale) strictly to INT. Do NOT use DECIMAL for plain NUMBER columns.
-        - Parameter markers (e.g., :param) are currently not allowed in the body of a CREATE VIEW statement in Databricks SQL. Do not Use parameters in CREATE VIEW. Use params in all other types of SQL.
-        - Ensure all syntax is 100% compatible with the Databricks SQL engine on Databricks Runtime 14.x or newer.
-        - Maintain the original logic, formatting, and comments from the source query.
-        - Do not add any of your own commentary, explanations, or markdown formatting.
-        - Return ONLY the raw, runnable Databricks SQL code.
-        - DO NOT add ticks and `sql` keyword at the beginning and end of the conversions. Return just the converted SQL.
-        - Replace variables with actual values in the procedure and instead of dynamic SQL Use regular queries. 
-        - Only convert if the operation involves matching records between source and target tables
-        - Do not convert simple single-table operations without joins or complex conditions
-        - Change stored procedures to multi-line SQL statements, do not convert to a stored procedure.
-      
-      %%##conversion_prompts##%%
-      %%##additional_prompts##%%
-      
-      --- START OF SQL ---
-      {oracle_sql}
-      --- END OF SQL ---
+TASK
+Convert Oracle SQL / Oracle DDL into Databricks-compatible Databricks SQL (DBR 14.x+).
+The user input will be a JSON object with an `objects` array, where each object contains `source_ddl`.
 
-notebook:
-  sql:
-    sql_script: |
-      You are a database migration expert. Convert Oracle SQL into a Databricks-compatible Databricks SQL notebook (SQL-only).
-      
-      Conversion rules:
-      
-      - Storage Clause Translation: Oracle-specific storage clauses (PARTITION BY RANGE/LIST/HASH, TABLESPACE, STORAGE) must be converted to Databricks SQL syntax.
-      - Partitioning: Replace PARTITION BY RANGE (...) (...) blocks entirely. Extract the column name used in the range and apply it to a CLUSTER BY (column_name) clause at the end of the CREATE TABLE statement.
-      - No Named Partitions: Remove all PARTITION <name> VALUES LESS THAN (...) syntax as it is not supported in Databricks. 
-      - [MANDATORY] Try to not put special characters in variable names. If you have to include special characters in key, or include semicolon in value, please Use backquotes, e.g., SET `key`=`value`.
-      - [MANDATORY] Table Storage: Every CREATE TABLE statement must explicitly include the USING DELTA clause before the closing semicolon. Do not change any other column definitions or logic while adding this clause
-      - [MANDATORY] When converting to STRING or BINARY, remove any length specifications from the source. For example, RAW(16) must become BINARY, and UROWID(4000). For VARCHAR2(X) and NVARCHAR2(X), convert to VARCHAR(X) and preserve the length specification.
-      - [MANDATORY] Do not include parentheses or length values for Databricks native types (STRING, BINARY, INT, BOOLEAN)  
-      - [MANDATORY] ONLY if a column in a CREATE TABLE statement uses the DEFAULT keyword, you must append the following property at the very end of the statement (after USING DELTA): TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported'). If no DEFAULT constraints exist, do NOT add TBLPROPERTIES.
-      - [MANDATORY] Ensure the DEFAULT <value> stays within the column definition logic, and only the TBLPROPERTIES is added at the end when DEFAULT constraints exist.
-      - [MANDATORY] Convert all variations of Oracle Timestamps (TIMESTAMP, TIMESTAMP WITH TIME ZONE, TIMESTAMP WITH LOCAL TIME ZONE) simply to TIMESTAMP.
-      - Forbidden: Do NOT include CHECK or UNIQUE keywords inside the CREATE TABLE (...) parentheses.
-      - [MANDATORY] Standalone ALTER TABLE is ONLY for CHECK and UNIQUE. All PRIMARY KEY and FOREIGN KEY must stay inside the CREATE TABLE block.
-      - MANDATORY REMOVAL: Identify all CHECK and UNIQUE constraints. You MUST remove them from the body of the CREATE TABLE statement entirely.
-      - MANDATORY ALTER: Generate each CHECK and UNIQUE constraint ONLY as a standalone ALTER TABLE statement appearing after the CREATE TABLE statement.
-      - KEY PRESERVATION: Keep PRIMARY KEY and FOREIGN KEY inside the CREATE TABLE definition. Do not move them to ALTER.
-      - [MANDATORY] Default Value Property: If any column definition within the CREATE TABLE statement contains the keyword DEFAULT, you MUST append the TBLPROPERTIES clause immediately following USING DELTA.
-      - [MANDATORY] Syntax: Always use CREATE TABLE (do NOT use OR REPLACE).
-      - The syntax must be: USING DELTA TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported');
-      - Convert all Oracle NCHAR(n) and NVARCHAR2(n) types to CHAR(n) and VARCHAR(n) respectively. Remove the N prefix but keep the fixed-length length logic. Convert VARCHAR2(n) to VARCHAR(n) and preserve the length specification.
-      - Remove or correct double-quoted identifiers (e.g., "Column" → Column or `Column`).
-      - Map types/functions to Databricks SQL: Maintain VARCHAR and CHAR types with their specified lengths (e.g., VARCHAR2(100) becomes VARCHAR(100), CHAR(10) remains CHAR(10)). Always preserve the length specifications in parentheses for VARCHAR and CHAR types.
-      - Ensure syntax is valid on Databricks SQL (DBR 14.x+).
-      - Preserve original logic and formatting. Comments are allowed, but keep them  concise and in proper SQL comment syntax.
-      - Parameter markers (e.g., :param) are currently not allowed in the body of a CREATE VIEW statement in Databricks SQL. Do not Use parameters in CREATE VIEW. Use params in all other types of SQL.
-      - Convert separate INSERT/UPDATE/DELETE operations into a single MERGE statement. Focus on: 1) Proper join conditions, 2) WHEN MATCHED/NOT MATCHED logic, 3) Error handling, and 4) Performance optimization through single table access. For example:
-          MERGE INTO target USING source
-          ON target.key = source.key
-          WHEN MATCHED AND target.marked_for_deletion THEN DELETE
-          WHEN MATCHED THEN UPDATE SET target.updated_at = source.updated_at, target.value = DEFAULT
-      - [MANDATORY] UPDATE in Databricks does not support FROM another table. For updating values from one table into another, Use MERGE. Do NOT Use `UPDATE ... FROM ...` under any circumstance.
-      - Analyze DDLs and identify all tables with ''fact'' in their name (case-insensitive). For each fact table found, change the CREATE TABLE statement to include CLUSTER BY AUTO for automatic liquid clustering optimization in Databricks. For example:
-          CREATE OR REPLACE TABLE ... (
-          id INT,
-          name STRING,
-          value DOUBLE
-          )
-          CLUSTER BY AUTO;
-      
-      If certain procedural parts cannot be fully expressed in SQL-only form, produce the best possible SQL-only approximation using sequential cells, TEMP VIEWs, MERGE/INSERT/COPY INTO, and deterministic set-based steps.
-      
-      %%##conversion_prompts##%%
-      %%##additional_prompts##%%
-      
-      --- START OF SQL ---
-      {oracle_sql}
-      --- END OF SQL ---
+MANDATORY OUTPUT FORMAT
+Return STRICT JSON ONLY (no markdown, no code fences, no backticks wrapping the whole response):
+{
+  "objects": [
+    {
+      "name": "<string>",
+      "kind": "table|view|sequence|procedure|function|other",
+      "schema": "<string|null>",
+      "target_sql": "<Databricks SQL text>",
+      "notes": ["<short notes>"]
+    }
+  ],
+  "warnings": ["<warning>"]
+}
 
-    procedure: |
-      You are a Databricks migration assistant. Your task is to convert Oracle SQL stored procedures into
-      Databricks-compatible **Databricks SQL notebooks** (SQL-only).
-    
-      Requirements:
-        - Focus only on the **core business logic** (tables, transformations, DML/DDL).
-        - **Do not** include logging, audit checkpoints, or procedural status updates.
-        - **Do not** include explanations, prose, or unnecessary comments.
-        - If the procedure has procedural loops/branches that cannot be expressed in SQL, refactor them into set-based SQL or split into multiple sequential cells with deterministic steps.
-      
-      HARD REQUIREMENTS (DO NOT SKIP):
-        - `IDENTIFIER` usage is not allowed with (temporary) VIEWs. Change [TEMP] or regular VIEWs to just TABLEs [NOT temp] to Use IDENTIFIER. Use target_schema for creating tables.
-        -  Reference widgets as `:widget` or `IDENTIFIER(:widget || ''.table'')`. $widget usage is not allowed inside the stored procedure.
-        - Try to not put special characters in variable names. If you have to include special characters in key, or include semicolon in value, please Use backquotes, e.g., SET `key`=`value`
-      """
+RULES (DDL CONVERSION)
+- Return Databricks SQL only inside `target_sql`. Every statement MUST end with a semicolon.
+- Do NOT include explanations/prose in `target_sql`.
+- Remove or correct double-quoted identifiers ("Column" -> Column or `Column`). Prefer backticks only when needed.
+- Do NOT use IDENTIFIER() in output. (This backend executes standalone SQL, not a notebook widget context.)
+- Convert schema-qualified names like "schema"."table" to just `table` unless a schema is explicitly required.
+
+DATA TYPES (MANDATORY)
+- Oracle NUMBER -> map strictly as follows:
+  * NUMBER            -> INT
+  * NUMBER(p)         -> DECIMAL(p)
+  * NUMBER(p, s)      -> DECIMAL(p, s)
+  Do NOT use DECIMAL for plain NUMBER.
+- Oracle TIMESTAMP (all variants) -> TIMESTAMP.
+- Oracle VARCHAR2(n) -> VARCHAR(n) (preserve length).
+- Oracle NVARCHAR2(n) -> VARCHAR(n) (preserve length).
+- Oracle NCHAR(n) -> CHAR(n) (preserve length).
+- When converting to STRING or BINARY, remove any length specification (e.g., RAW(16) -> BINARY; do not emit BINARY(16)).
+
+TABLE STORAGE (MANDATORY)
+- Every CREATE TABLE statement MUST include `USING DELTA`.
+- If any column uses DEFAULT, append: TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported') at the very end of the CREATE TABLE statement.
+
+PARTITIONING / STORAGE CLAUSES
+- Remove Oracle-only physical/storage clauses (TABLESPACE, STORAGE, PCTFREE, etc.).
+- Replace PARTITION BY RANGE/LIST/HASH blocks with Databricks equivalents:
+  * For RANGE partition blocks: remove named partitions and use CLUSTER BY (<range_column>) instead.
+
+CONSTRAINTS (MANDATORY)
+- PRIMARY KEY and FOREIGN KEY must remain inside CREATE TABLE.
+- CHECK and UNIQUE must NOT appear inside CREATE TABLE (...).
+  You MUST remove them from CREATE TABLE and emit them as standalone ALTER TABLE statements after the CREATE TABLE.
+  (If a CHECK/UNIQUE cannot be represented, emit it as a SQL comment with REVIEW REQUIRED.)
+
+FACT TABLE OPTIMIZATION
+- If a table name contains 'fact' (case-insensitive), include `CLUSTER BY AUTO`.
+
+DML / PROCEDURAL NOTES
+- Parameter markers (e.g., :param) are not allowed inside CREATE VIEW bodies in Databricks SQL. Do not use parameters in CREATE VIEW.
+- UPDATE ... FROM is not supported in Databricks; use MERGE for multi-table updates.
+- If stored procedures are provided, convert to SQL-only multi-statement scripts (not stored procedures).
+"""
     else:
         system_prompt = f"""You are an expert database migration engine. Convert DDL from {source_dialect} to {target_dialect}.
 
@@ -592,7 +550,14 @@ def fallback_translation(objects_list: list, source_dialect: str, target_dialect
                 "Target schema is controlled by Snowflake connection context"
             ]
         elif ("oracle" in source_dialect.lower()) and ("databricks" in target_dialect.lower()):
-            # Convert Oracle DDL to Databricks SQL (basic, table-only).
+            # Convert Oracle DDL to Databricks SQL (basic, table-focused).
+            # This fallback aligns with the stricter enterprise DDL rules:
+            #   - NUMBER -> INT (no p/s)
+            #   - NUMBER(p) -> DECIMAL(p)
+            #   - NUMBER(p,s) -> DECIMAL(p,s)
+            #   - VARCHAR2/NVARCHAR2 -> VARCHAR(n)
+            #   - NCHAR -> CHAR(n)
+            #   - RAW/BLOB -> BINARY (no length)
             target_ddl = source_ddl or f'CREATE TABLE "{obj_name}" (id NUMBER);'
 
             # Remove schema qualifier from CREATE TABLE and switch to backticks.
@@ -606,20 +571,30 @@ def fallback_translation(objects_list: list, source_dialect: str, target_dialect
             # Normalize identifiers to backticks for Databricks.
             target_ddl = target_ddl.replace('"', '`')
 
-            # Type conversions (Oracle -> Databricks).
-            target_ddl = re.sub(r'\bVARCHAR2\b', 'STRING', target_ddl, flags=re.IGNORECASE)
-            target_ddl = re.sub(r'\bNVARCHAR2\b', 'STRING', target_ddl, flags=re.IGNORECASE)
-            target_ddl = re.sub(r'\bNCHAR\b', 'STRING', target_ddl, flags=re.IGNORECASE)
-            target_ddl = re.sub(r'\bCHAR\b', 'STRING', target_ddl, flags=re.IGNORECASE)
+            # Preserve VARCHAR/CHAR lengths; remove N prefix.
+            target_ddl = re.sub(r'\bNVARCHAR2\s*\(', 'VARCHAR(', target_ddl, flags=re.IGNORECASE)
+            target_ddl = re.sub(r'\bVARCHAR2\s*\(', 'VARCHAR(', target_ddl, flags=re.IGNORECASE)
+            target_ddl = re.sub(r'\bNCHAR\s*\(', 'CHAR(', target_ddl, flags=re.IGNORECASE)
+
+            # Large objects.
             target_ddl = re.sub(r'\bCLOB\b', 'STRING', target_ddl, flags=re.IGNORECASE)
             target_ddl = re.sub(r'\bNCLOB\b', 'STRING', target_ddl, flags=re.IGNORECASE)
             target_ddl = re.sub(r'\bBLOB\b', 'BINARY', target_ddl, flags=re.IGNORECASE)
+            target_ddl = re.sub(r'\bRAW\s*\(\s*\d+\s*\)', 'BINARY', target_ddl, flags=re.IGNORECASE)
             target_ddl = re.sub(r'\bRAW\b', 'BINARY', target_ddl, flags=re.IGNORECASE)
+            target_ddl = re.sub(r'\bUROWID\s*\(\s*\d+\s*\)', 'STRING', target_ddl, flags=re.IGNORECASE)
+            target_ddl = re.sub(r'\bUROWID\b', 'STRING', target_ddl, flags=re.IGNORECASE)
+
+            # Timestamp variants.
+            target_ddl = re.sub(r'\bTIMESTAMP\s+WITH\s+LOCAL\s+TIME\s+ZONE\b', 'TIMESTAMP', target_ddl, flags=re.IGNORECASE)
+            target_ddl = re.sub(r'\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b', 'TIMESTAMP', target_ddl, flags=re.IGNORECASE)
+
+            # Floating point.
             target_ddl = re.sub(r'\bBINARY_FLOAT\b', 'FLOAT', target_ddl, flags=re.IGNORECASE)
             target_ddl = re.sub(r'\bBINARY_DOUBLE\b', 'DOUBLE', target_ddl, flags=re.IGNORECASE)
             target_ddl = re.sub(r'\bFLOAT\b', 'DOUBLE', target_ddl, flags=re.IGNORECASE)
 
-            # NUMBER(p,s) -> DECIMAL(p,s), NUMBER(p) -> DECIMAL(p,0), NUMBER -> DECIMAL(38,10)
+            # NUMBER rules.
             target_ddl = re.sub(
                 r'\bNUMBER\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)',
                 r'DECIMAL(\1,\2)',
@@ -628,22 +603,38 @@ def fallback_translation(objects_list: list, source_dialect: str, target_dialect
             )
             target_ddl = re.sub(
                 r'\bNUMBER\s*\(\s*(\d+)\s*\)',
-                r'DECIMAL(\1,0)',
+                r'DECIMAL(\1)',
                 target_ddl,
                 flags=re.IGNORECASE
             )
-            target_ddl = re.sub(r'\bNUMBER\b', 'DECIMAL(38,10)', target_ddl, flags=re.IGNORECASE)
+            target_ddl = re.sub(r'\bNUMBER\b', 'INT', target_ddl, flags=re.IGNORECASE)
 
-            # Date/time defaults.
+            # Date/time defaults: SYSDATE is a TIMESTAMP in Oracle; for DATE defaults, prefer CURRENT_DATE.
+            target_ddl = re.sub(r'\bDATE\s+DEFAULT\s+SYSDATE\b', 'DATE DEFAULT CURRENT_DATE', target_ddl, flags=re.IGNORECASE)
             target_ddl = re.sub(r'\bSYSDATE\b', 'CURRENT_TIMESTAMP', target_ddl, flags=re.IGNORECASE)
+
+            # Remove any illegal type lengths for BINARY/STRING.
+            target_ddl = re.sub(r'\bBINARY\s*\(\s*\d+\s*\)', 'BINARY', target_ddl, flags=re.IGNORECASE)
+            target_ddl = re.sub(r'\bSTRING\s*\(\s*\d+\s*\)', 'STRING', target_ddl, flags=re.IGNORECASE)
+
+            # Best-effort ensure USING DELTA for CREATE TABLE.
+            if re.search(r'(?is)^\s*CREATE\s+TABLE\b', target_ddl) and not re.search(r'(?is)\bUSING\s+DELTA\b', target_ddl):
+                # Insert USING DELTA before TBLPROPERTIES/CLUSTER BY/semicolon.
+                if re.search(r'(?is)\bTBLPROPERTIES\b', target_ddl):
+                    target_ddl = re.sub(r'(?is)\bTBLPROPERTIES\b', 'USING DELTA TBLPROPERTIES', target_ddl, count=1)
+                elif re.search(r'(?is)\bCLUSTER\s+BY\b', target_ddl):
+                    target_ddl = re.sub(r'(?is)\bCLUSTER\s+BY\b', 'USING DELTA CLUSTER BY', target_ddl, count=1)
+                else:
+                    target_ddl = target_ddl.strip().rstrip(';') + ' USING DELTA;'
 
             # Clean up trailing semicolons.
             target_ddl = target_ddl.strip().rstrip(';') + ';'
 
             notes = [
                 f"Fallback translation from {source_dialect} to {target_dialect}",
-                "Converted common Oracle types to Databricks types",
-                "Dropped schema qualifier to use Databricks connection schema"
+                "Aligned NUMBER mapping to INT/DECIMAL per enterprise rules",
+                "Preserved VARCHAR/CHAR lengths",
+                "Added USING DELTA to CREATE TABLE"
             ]
         elif ("postgres" in source_dialect.lower()) and ("snowflake" in target_dialect.lower()):
             # Convert PostgreSQL DDL to Snowflake DDL (minimal, focusing on common Postgres features).

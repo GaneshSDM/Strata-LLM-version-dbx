@@ -1061,6 +1061,9 @@ async def convert_ddl(req: ConvertDdlRequest, request: Request):
                     exec_res = await target_adapter.run_ddl(response["target_sql"])
                     response["executed"] = exec_res.get("ok", False)
                     response["execution_error"] = exec_res.get("error")
+                    # New: surface per-statement execution results so the UI can show OK/error
+                    # exactly as Databricks reports it.
+                    response["execution"] = exec_res
                 else:
                     response["executed"] = False
                     response["execution_error"] = "Target connection not found"

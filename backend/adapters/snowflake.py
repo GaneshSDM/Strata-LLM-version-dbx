@@ -1732,6 +1732,16 @@ class SnowflakeAdapter(DatabaseAdapter):
             return []
 
         def list_sync():
+            def _qident(identifier: str) -> str:
+                return '"' + str(identifier).replace('"', '""') + '"'
+
+            def _maybe_unquoted(ident: str) -> str:
+                # If simple identifier, prefer unquoted so Snowflake folds to uppercase.
+                import re
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", ident or ""):
+                    return ident
+                return _qident(ident)
+
             context = self._resolve_writable_context()
             database = context["database"]
             default_schema = context["schema"]
@@ -1773,7 +1783,7 @@ class SnowflakeAdapter(DatabaseAdapter):
                             break
                     except Exception:
                         continue
-        return cols
+                return cols
             finally:
                 cur.close()
                 conn.close()

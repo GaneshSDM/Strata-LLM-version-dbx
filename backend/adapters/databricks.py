@@ -11,6 +11,136 @@ try:
 except ImportError:
     DRIVER_AVAILABLE = False
 
+
+def _split_sql_statements(sql_text: str) -> List[str]:
+    """Split a SQL script into individual statements.
+
+    Best-effort splitter that respects:
+    - single quotes (with doubled '' escaping)
+    - double quotes
+    - backticks
+    - line comments (-- ...)
+    - block comments (/* ... */)
+
+    We need this because the Databricks SQL connector generally expects one
+    statement per execute call, but our AI-generated DDL can include:
+      CREATE TABLE ...;
+      ALTER TABLE ...;
+      ...
+    """
+    text = str(sql_text or "")
+    if not text.strip():
+        return []
+
+    statements: List[str] = []
+    buf: List[str] = []
+    in_single = False
+    in_double = False
+    in_backtick = False
+    in_line_comment = False
+    in_block_comment = False
+
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            buf.append(ch)
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            buf.append(ch)
+            if ch == "*" and nxt == "/":
+                buf.append(nxt)
+                i += 2
+                in_block_comment = False
+                continue
+            i += 1
+            continue
+
+        # Comment start
+        if (not in_single) and (not in_double) and (not in_backtick):
+            if ch == "-" and nxt == "-":
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                in_line_comment = True
+                continue
+            if ch == "/" and nxt == "*":
+                buf.append(ch)
+                buf.append(nxt)
+                i += 2
+                in_block_comment = True
+                continue
+
+        # Quote toggles
+        if (not in_double) and (not in_backtick) and ch == "'":
+            buf.append(ch)
+            # Handle escaped '' inside single-quoted string.
+            if in_single and nxt == "'":
+                buf.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+            i += 1
+            continue
+        if (not in_single) and (not in_backtick) and ch == '"':
+            buf.append(ch)
+            in_double = not in_double
+            i += 1
+            continue
+        if (not in_single) and (not in_double) and ch == "`":
+            buf.append(ch)
+            in_backtick = not in_backtick
+            i += 1
+            continue
+
+        # Statement terminator
+        if (not in_single) and (not in_double) and (not in_backtick) and ch == ";":
+            current = "".join(buf).strip()
+            if current:
+                statements.append(current)
+            buf = []
+            i += 1
+            continue
+
+        buf.append(ch)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _ensure_using_delta(statement: str) -> str:
+    """Ensure a CREATE TABLE statement contains USING DELTA.
+
+    This is a minimal normalizer used in the ad-hoc execution path
+    (/api/ddl/convert -> run_ddl). We keep it intentionally small so we
+    don't unexpectedly rewrite non-table DDL.
+    """
+    ddl = str(statement or "").strip()
+    if not ddl:
+        return ddl
+    if not re.match(r'(?is)^\s*CREATE\s+TABLE\b', ddl):
+        return ddl
+    if re.search(r'(?is)\bUSING\s+DELTA\b', ddl):
+        return ddl
+
+    ddl = ddl.strip().rstrip(";")
+    if re.search(r'(?is)\bTBLPROPERTIES\b', ddl):
+        ddl = re.sub(r'(?is)\bTBLPROPERTIES\b', 'USING DELTA TBLPROPERTIES', ddl, count=1)
+    elif re.search(r'(?is)\bCLUSTER\s+BY\b', ddl):
+        ddl = re.sub(r'(?is)\bCLUSTER\s+BY\b', 'USING DELTA CLUSTER BY', ddl, count=1)
+    else:
+        ddl = ddl + ' USING DELTA'
+    return ddl + ";"
+
 class DatabricksAdapter(DatabaseAdapter):
     def __init__(self, credentials: dict):
         super().__init__(credentials)
@@ -706,6 +836,9 @@ class DatabricksAdapter(DatabaseAdapter):
         try:
             def create_sync():
                 import re
+
+                # NOTE: use module-level splitter so create_objects and run_ddl behave consistently.
+
                 def _normalize_ddl(raw: str) -> str:
                     import re
 
@@ -729,29 +862,42 @@ class DatabricksAdapter(DatabaseAdapter):
                     # Normalize identifiers.
                     ddl = ddl.replace('"', '`')
 
-                    # Oracle -> Databricks type conversions.
-                    ddl = re.sub(r'\bVARCHAR2\b', 'STRING', ddl, flags=re.IGNORECASE)
-                    ddl = re.sub(r'\bNVARCHAR2\b', 'STRING', ddl, flags=re.IGNORECASE)
-                    ddl = re.sub(r'\bNCHAR\b', 'STRING', ddl, flags=re.IGNORECASE)
-                    ddl = re.sub(r'\bCHAR\b', 'STRING', ddl, flags=re.IGNORECASE)
+                    # Oracle -> Databricks type conversions (best-effort).
+                    # IMPORTANT: preserve VARCHAR/CHAR lengths; prefer VARCHAR/CHAR over STRING where possible.
+                    ddl = re.sub(r'\bNVARCHAR2\s*\(', 'VARCHAR(', ddl, flags=re.IGNORECASE)
+                    ddl = re.sub(r'\bVARCHAR2\s*\(', 'VARCHAR(', ddl, flags=re.IGNORECASE)
+                    ddl = re.sub(r'\bNVARCHAR2\b', 'VARCHAR', ddl, flags=re.IGNORECASE)
+                    ddl = re.sub(r'\bVARCHAR2\b', 'VARCHAR', ddl, flags=re.IGNORECASE)
+                    ddl = re.sub(r'\bNCHAR\s*\(', 'CHAR(', ddl, flags=re.IGNORECASE)
+                    ddl = re.sub(r'\bNCHAR\b', 'CHAR', ddl, flags=re.IGNORECASE)
+
+                    # Large objects.
                     ddl = re.sub(r'\bCLOB\b', 'STRING', ddl, flags=re.IGNORECASE)
                     ddl = re.sub(r'\bNCLOB\b', 'STRING', ddl, flags=re.IGNORECASE)
                     ddl = re.sub(r'\bTEXT\b', 'STRING', ddl, flags=re.IGNORECASE)
                     ddl = re.sub(r'\bBLOB\b', 'BINARY', ddl, flags=re.IGNORECASE)
                     ddl = re.sub(r'\bRAW\b', 'BINARY', ddl, flags=re.IGNORECASE)
+
+                    # Floating point.
                     ddl = re.sub(r'\bBINARY_FLOAT\b', 'FLOAT', ddl, flags=re.IGNORECASE)
                     ddl = re.sub(r'\bBINARY_DOUBLE\b', 'DOUBLE', ddl, flags=re.IGNORECASE)
                     ddl = re.sub(r'\bFLOAT\b', 'DOUBLE', ddl, flags=re.IGNORECASE)
 
-                    # Databricks/Spark does not support STRING(n). If upstream translation produced STRING(100),
-                    # collapse it to STRING so table creation succeeds.
+                    # Normalize illegal length specifications for native Spark types.
                     ddl = re.sub(
                         r'\bSTRING\s*\(\s*\d+\s*(?:CHAR|BYTE)?\s*\)',
                         'STRING',
                         ddl,
                         flags=re.IGNORECASE
                     )
+                    ddl = re.sub(
+                        r'\bBINARY\s*\(\s*\d+\s*\)',
+                        'BINARY',
+                        ddl,
+                        flags=re.IGNORECASE
+                    )
 
+                    # NUMBER mapping (enterprise rule-aligned) in case any Oracle NUMBER leaks through.
                     ddl = re.sub(
                         r'\bNUMBER\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)',
                         r'DECIMAL(\1,\2)',
@@ -760,11 +906,11 @@ class DatabricksAdapter(DatabaseAdapter):
                     )
                     ddl = re.sub(
                         r'\bNUMBER\s*\(\s*(\d+)\s*\)',
-                        r'DECIMAL(\1,0)',
+                        r'DECIMAL(\1)',
                         ddl,
                         flags=re.IGNORECASE
                     )
-                    ddl = re.sub(r'\bNUMBER\b', 'DECIMAL(38,10)', ddl, flags=re.IGNORECASE)
+                    ddl = re.sub(r'\bNUMBER\b', 'INT', ddl, flags=re.IGNORECASE)
 
                     ddl = re.sub(r'\bSYSDATE\b', 'CURRENT_TIMESTAMP', ddl, flags=re.IGNORECASE)
 
@@ -775,6 +921,16 @@ class DatabricksAdapter(DatabaseAdapter):
                         ddl,
                         flags=re.IGNORECASE
                     )
+
+                    # Ensure CREATE TABLE uses Delta (enterprise rule).
+                    if re.match(r'(?is)^\s*CREATE\s+TABLE\b', ddl) and not re.search(r'(?is)\bUSING\s+DELTA\b', ddl):
+                        ddl = ddl.strip().rstrip(";")
+                        if re.search(r'(?is)\bTBLPROPERTIES\b', ddl):
+                            ddl = re.sub(r'(?is)\bTBLPROPERTIES\b', 'USING DELTA TBLPROPERTIES', ddl, count=1)
+                        elif re.search(r'(?is)\bCLUSTER\s+BY\b', ddl):
+                            ddl = re.sub(r'(?is)\bCLUSTER\s+BY\b', 'USING DELTA CLUSTER BY', ddl, count=1)
+                        else:
+                            ddl = ddl + ' USING DELTA'
 
                     def _ensure_tblproperties(statement: str, props: Dict[str, str]) -> str:
                         if not props:
@@ -874,22 +1030,28 @@ class DatabricksAdapter(DatabaseAdapter):
                             })
                             continue
 
-                        attempted_sql += 1
-                        ddl = _normalize_ddl(raw_ddl)
-                        ddl = _rewrite_schema_refs(ddl, default_schema)
-                        if not ddl:
+                        cursor.execute(f"USE CATALOG `{default_catalog}`")
+                        cursor.execute(f"USE SCHEMA `{default_schema}`")
+
+                        statements = _split_sql_statements(str(raw_ddl))
+                        if not statements:
                             skipped.append({
                                 "name": obj.get("name", "unknown"),
                                 "schema": obj.get("schema", default_schema),
-                                "error": "Normalized DDL was empty",
+                                "error": "No SQL statements found",
                                 "ddl": "",
                                 "original_ddl": raw_ddl or ""
                             })
                             continue
 
-                        cursor.execute(f"USE CATALOG `{default_catalog}`")
-                        cursor.execute(f"USE SCHEMA `{default_schema}`")
-                        cursor.execute(ddl)
+                        for stmt in statements:
+                            attempted_sql += 1
+                            ddl = _normalize_ddl(stmt)
+                            ddl = _rewrite_schema_refs(ddl, default_schema)
+                            if not ddl:
+                                continue
+                            cursor.execute(ddl)
+
                         created_count += 1
                     except Exception as e:
                         # Log the original DDL and normalized DDL for debugging
@@ -1190,16 +1352,74 @@ class DatabricksAdapter(DatabaseAdapter):
         if not self.driver_available:
             return {"ok": False, "error": "Databricks driver unavailable"}
         try:
+            def _extract_error_fields(err: Exception) -> Dict[str, Any]:
+                fields: Dict[str, Any] = {}
+                for key in ("sqlstate", "error_code", "errorCode", "status_code", "statusCode"):
+                    val = getattr(err, key, None)
+                    if val is not None:
+                        fields[key] = val
+                # Some Databricks connector errors wrap extra info in args.
+                if hasattr(err, "args") and err.args:
+                    fields["args"] = [str(a) for a in err.args[:3]]
+                return fields
+
             connection = self.get_connection()
             cursor = connection.cursor()
-            for stmt in filter(None, (s.strip() for s in ddl.split(';'))):
-                cursor.execute(stmt)
-            connection.commit()
+
+            # Ensure we're in the configured catalog/schema for the connection.
+            default_catalog = self.credentials.get("catalog") or self.credentials.get("catalogName", "hive_metastore")
+            default_schema = self.credentials.get("schema") or self.credentials.get("schemaName", "default")
+            try:
+                cursor.execute(f"USE CATALOG `{default_catalog}`")
+            except Exception:
+                pass
+            try:
+                cursor.execute(f"USE SCHEMA `{default_schema}`")
+            except Exception:
+                pass
+
+            statements = _split_sql_statements(ddl)
+            results: List[Dict[str, Any]] = []
+
+            for idx, stmt in enumerate(statements):
+                stmt_text = str(stmt or "").strip()
+                if not stmt_text:
+                    continue
+                stmt_to_run = _ensure_using_delta(stmt_text)
+                try:
+                    cursor.execute(stmt_to_run)
+                    results.append({
+                        "index": idx,
+                        "statement": stmt_text,
+                        "ok": True
+                    })
+                except Exception as e:
+                    err_text = str(e)
+                    results.append({
+                        "index": idx,
+                        "statement": stmt_text,
+                        "ok": False,
+                        "error": err_text,
+                        **_extract_error_fields(e)
+                    })
+                    # Stop at first failure to avoid cascading/opaque errors.
+                    break
+
+            ok = all(r.get("ok") for r in results) if results else False
+            if ok:
+                connection.commit()
+
             cursor.close()
             connection.close()
-            return {"ok": True}
+
+            first_error = next((r.get("error") for r in results if not r.get("ok")), None)
+            return {
+                "ok": ok,
+                "statements": results,
+                "error": first_error
+            }
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e), "statements": []}
 
     async def rename_column(self, table_name: str, old_column_name: str, new_column_name: str) -> Dict[str, Any]:
         """Rename a column in Databricks using ALTER TABLE ... RENAME COLUMN ... TO ..."""
