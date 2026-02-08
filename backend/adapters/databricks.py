@@ -141,6 +141,110 @@ def _ensure_using_delta(statement: str) -> str:
         ddl = ddl + ' USING DELTA'
     return ddl + ";"
 
+
+# Shared normalization helpers so ad-hoc run_ddl and bulk create_objects behave consistently.
+def _normalize_ddl_for_databricks(raw: str) -> str:
+    """Best-effort normalization of Oracle-ish DDL into Databricks-friendly SQL.
+
+    Mirrors the rules used in create_objects(), but available at module scope so
+    run_ddl() (used by the ad-hoc DDL converter) benefits from the same safety rails.
+    """
+    import re
+
+    ddl = (raw or "").strip()
+    if not ddl:
+        return ""
+
+    # Replace Oracle schema qualifiers and normalize CREATE TABLE prefix.
+    m = re.match(r'(?is)^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?(?P<name>[^(\n]+)\s*\(', ddl)
+    if m:
+        raw_name = (m.group("name") or "").strip()
+        parts = [p.strip().strip('`"') for p in raw_name.split(".") if p.strip()]
+        table_only = parts[-1] if parts else raw_name.strip('`"')
+        ddl = re.sub(
+            r'(?is)^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[^(\n]+\s*\(',
+            f'CREATE TABLE IF NOT EXISTS `{table_only}` (',
+            ddl,
+            count=1
+        )
+
+    # Normalize identifiers.
+    ddl = ddl.replace('"', '`')
+
+    # Oracle -> Databricks type conversions (best-effort). Preserve VARCHAR/CHAR lengths.
+    ddl = re.sub(r'\bNVARCHAR2\s*\(', 'VARCHAR(', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bVARCHAR2\s*\(', 'VARCHAR(', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bNVARCHAR2\b', 'VARCHAR', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bVARCHAR2\b', 'VARCHAR', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bNCHAR\s*\(', 'CHAR(', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bNCHAR\b', 'CHAR', ddl, flags=re.IGNORECASE)
+
+    # Large objects.
+    ddl = re.sub(r'\bCLOB\b', 'STRING', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bNCLOB\b', 'STRING', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bTEXT\b', 'STRING', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bBLOB\b', 'BINARY', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bRAW\b', 'BINARY', ddl, flags=re.IGNORECASE)
+
+    # Floating point.
+    ddl = re.sub(r'\bBINARY_FLOAT\b', 'FLOAT', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bBINARY_DOUBLE\b', 'DOUBLE', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bFLOAT\b', 'DOUBLE', ddl, flags=re.IGNORECASE)
+
+    # Normalize illegal length specs for native Spark types.
+    ddl = re.sub(r'\bSTRING\s*\(\s*\d+\s*(?:CHAR|BYTE)?\s*\)', 'STRING', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bBINARY\s*\(\s*\d+\s*\)', 'BINARY', ddl, flags=re.IGNORECASE)
+
+    # NUMBER mappings.
+    ddl = re.sub(r'\bNUMBER\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)', r'DECIMAL(\1,\2)', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bNUMBER\s*\(\s*(\d+)\s*\)', r'DECIMAL(\1)', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bNUMBER\b', 'INT', ddl, flags=re.IGNORECASE)
+
+    ddl = re.sub(r'\bSYSDATE\b', 'CURRENT_TIMESTAMP', ddl, flags=re.IGNORECASE)
+
+    # DATE default fix.
+    ddl = re.sub(r'\bDATE\s+DEFAULT\s+CURRENT_TIMESTAMP\s*(?:\(\s*\))?', 'DATE DEFAULT CURRENT_DATE', ddl, flags=re.IGNORECASE)
+
+    # Strip Oracle-specific physical/storage clauses.
+    ddl = re.sub(r'\bENABLE\b', '', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bUSING\s+INDEX\b[^,\n\)]*', '', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bTABLESPACE\b[^,\n\)]*', '', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bPCTFREE\b[^,\n\)]*', '', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bINITRANS\b[^,\n\)]*', '', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bMAXTRANS\b[^,\n\)]*', '', ddl, flags=re.IGNORECASE)
+    ddl = re.sub(r'\bSTORAGE\b\s*\([^)]*\)', '', ddl, flags=re.IGNORECASE)
+
+    # Ensure USING DELTA for CREATE TABLE.
+    ddl = _ensure_using_delta(ddl)
+    return ddl
+
+
+def _rewrite_schema_refs(statement: str, target_schema: str) -> str:
+    """Rewrite REFERENCES schema qualifiers to use the configured target schema."""
+    import re
+    if not statement or not target_schema:
+        return statement
+    schema_token = f"`{str(target_schema).strip('`')}`"
+
+    def _q(name: str) -> str:
+        cleaned = str(name or "").strip()
+        if not cleaned:
+            return cleaned
+        if cleaned.startswith("`") and cleaned.endswith("`"):
+            return cleaned
+        return f"`{cleaned.strip('`')}`"
+
+    pattern = re.compile(
+        r'(?is)\bREFERENCES\s+(?P<schema>`[^`]+`|\"[^\"]+\"|\w+)\s*\.\s*(?P<table>`[^`]+`|\"[^\"]+\"|\w+)'
+    )
+
+    def _replace(match: re.Match) -> str:
+        table = match.group("table")
+        return f"REFERENCES {schema_token}.{_q(table)}"
+
+    return pattern.sub(_replace, statement)
+
+
 class DatabricksAdapter(DatabaseAdapter):
     def __init__(self, credentials: dict):
         super().__init__(credentials)
@@ -687,7 +791,7 @@ class DatabricksAdapter(DatabaseAdapter):
                     "constraints": [],  # Databricks has limited constraint support
                     "views": views,
                     "procedures": procedures,
-                    "indexes": indexes,  # Databricks uses Delta Lake which handles indexing differently
+                    "indexes": indexes,  # Databricks uses Delta Lake which handles optimization differently
                     "triggers": triggers,
                     "sequences": sequences,
                     "user_types": user_types,
@@ -1369,8 +1473,13 @@ class DatabricksAdapter(DatabaseAdapter):
             # Ensure we're in the configured catalog/schema for the connection.
             default_catalog = self.credentials.get("catalog") or self.credentials.get("catalogName", "hive_metastore")
             default_schema = self.credentials.get("schema") or self.credentials.get("schemaName", "default")
+            # Ensure catalog/schema exist and are active.
             try:
                 cursor.execute(f"USE CATALOG `{default_catalog}`")
+            except Exception:
+                pass
+            try:
+                cursor.execute(f"CREATE SCHEMA IF NOT EXISTS `{default_schema}`")
             except Exception:
                 pass
             try:
@@ -1385,7 +1494,9 @@ class DatabricksAdapter(DatabaseAdapter):
                 stmt_text = str(stmt or "").strip()
                 if not stmt_text:
                     continue
-                stmt_to_run = _ensure_using_delta(stmt_text)
+                # Normalize and rewrite to increase success rate on Databricks
+                normalized = _normalize_ddl_for_databricks(stmt_text)
+                stmt_to_run = _rewrite_schema_refs(normalized, default_schema)
                 try:
                     cursor.execute(stmt_to_run)
                     results.append({

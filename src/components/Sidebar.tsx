@@ -1,4 +1,4 @@
-import { Search, Download, Database, Zap, Terminal } from 'lucide-react';
+import { Search, Download, Database, Zap, Terminal, SlidersHorizontal } from 'lucide-react';
 import { Link, useLocation } from 'react-router-dom';
 import strataLogo from '../assets/image (1)_1763392280085.png';
 import { StageProgress } from '../types/workflow';
@@ -25,6 +25,13 @@ const navigationItems = [
     description: 'Session log feed',
     icon: Terminal,
     path: '/logs',
+  },
+  {
+    id: 4,
+    title: 'Data Types',
+    description: 'Source/target datatype mappings',
+    icon: SlidersHorizontal,
+    path: '/datatypes',
   },
 ];
 

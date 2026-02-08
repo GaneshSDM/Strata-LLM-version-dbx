@@ -90,7 +90,8 @@ async def init_db():
                     run_id INTEGER REFERENCES runs(id),
                     selected_tables TEXT,
                     selected_columns TEXT,
-                    column_renames TEXT
+                    column_renames TEXT,
+                    datatype_overrides TEXT
                 )
             """)
             try:
@@ -99,6 +100,10 @@ async def init_db():
                 pass
             try:
                 await conn.execute("ALTER TABLE active_session ADD COLUMN IF NOT EXISTS column_renames TEXT")
+            except Exception:
+                pass
+            try:
+                await conn.execute("ALTER TABLE active_session ADD COLUMN IF NOT EXISTS datatype_overrides TEXT")
             except Exception:
                 pass
     else:
@@ -164,6 +169,7 @@ async def init_db():
                     selected_tables TEXT,
                     selected_columns TEXT,
                     column_renames TEXT,
+                    datatype_overrides TEXT,
                     FOREIGN KEY (source_id) REFERENCES connections(id),
                     FOREIGN KEY (target_id) REFERENCES connections(id),
                     FOREIGN KEY (run_id) REFERENCES runs(id)
@@ -201,6 +207,11 @@ async def init_db():
             if "column_renames" not in session_columns:
                 try:
                     await db.execute("ALTER TABLE active_session ADD COLUMN column_renames TEXT")
+                except Exception:
+                    pass
+            if "datatype_overrides" not in session_columns:
+                try:
+                    await db.execute("ALTER TABLE active_session ADD COLUMN datatype_overrides TEXT")
                 except Exception:
                     pass
             
@@ -256,39 +267,53 @@ class ConnectionModel:
 
 class SessionModel:
     @staticmethod
-    async def set_session(source_id: int, target_id: int, run_id: int, selected_tables: list = None, selected_columns: dict = None, column_renames: dict = None):
+    async def set_session(
+        source_id: int,
+        target_id: int,
+        run_id: int,
+        selected_tables: list = None,
+        selected_columns: dict = None,
+        column_renames: dict = None,
+        datatype_overrides: dict = None
+    ):
         # Serialize selected_tables to JSON string for storage
         selected_tables_json = json.dumps(selected_tables) if selected_tables else None
         selected_columns_json = json.dumps(selected_columns) if selected_columns is not None else None
         # Preserve previously saved renames when not explicitly provided.
         column_renames_json = json.dumps(column_renames) if column_renames is not None else None
-        
+       
+        datatype_overrides_json = json.dumps(datatype_overrides) if datatype_overrides is not None else None
+
         if USE_POSTGRES:
             pool = await get_pg_pool()
             async with pool.acquire() as conn:
-                existing = await conn.fetchrow("SELECT selected_columns, column_renames FROM active_session WHERE id = 1")
+                existing = await conn.fetchrow("SELECT selected_columns, column_renames, datatype_overrides FROM active_session WHERE id = 1")
                 if selected_columns_json is None and existing and existing.get("selected_columns"):
                     selected_columns_json = existing["selected_columns"]
                 if column_renames_json is None and existing and existing.get("column_renames"):
                     column_renames_json = existing["column_renames"]
+                if datatype_overrides_json is None and existing and existing.get("datatype_overrides"):
+                    datatype_overrides_json = existing["datatype_overrides"]
                 await conn.execute("DELETE FROM active_session")
                 await conn.execute(
-                    "INSERT INTO active_session (id, source_id, target_id, run_id, selected_tables, selected_columns, column_renames) VALUES (1, $1, $2, $3, $4, $5, $6)",
-                    source_id, target_id, run_id, selected_tables_json, selected_columns_json, column_renames_json
+                    "INSERT INTO active_session (id, source_id, target_id, run_id, selected_tables, selected_columns, column_renames, datatype_overrides) VALUES (1, $1, $2, $3, $4, $5, $6, $7)",
+                    source_id, target_id, run_id, selected_tables_json, selected_columns_json, column_renames_json, datatype_overrides_json
                 )
         else:
             async with aiosqlite.connect(DATABASE_PATH) as db:
                 existing = None
-                async with db.execute("SELECT selected_columns, column_renames FROM active_session WHERE id = 1") as cursor:
+                async with db.execute("SELECT selected_columns, column_renames, datatype_overrides FROM active_session WHERE id = 1") as cursor:
                     existing = await cursor.fetchone()
                 if selected_columns_json is None and existing and existing[0]:
                     selected_columns_json = existing[0]
                 if column_renames_json is None and existing and existing[1]:
                     column_renames_json = existing[1]
+                if datatype_overrides_json is None and existing and existing[2]:
+                    datatype_overrides_json = existing[2]
                 await db.execute("DELETE FROM active_session")
                 await db.execute(
-                    "INSERT INTO active_session (id, source_id, target_id, run_id, selected_tables, selected_columns, column_renames) VALUES (1, ?, ?, ?, ?, ?, ?)",
-                    (source_id, target_id, run_id, selected_tables_json, selected_columns_json, column_renames_json)
+                    "INSERT INTO active_session (id, source_id, target_id, run_id, selected_tables, selected_columns, column_renames, datatype_overrides) VALUES (1, ?, ?, ?, ?, ?, ?, ?)",
+                    (source_id, target_id, run_id, selected_tables_json, selected_columns_json, column_renames_json, datatype_overrides_json)
                 )
                 await db.commit()
     
@@ -315,6 +340,11 @@ class SessionModel:
                         result['column_renames'] = json.loads(result['column_renames'])
                     except:
                         result['column_renames'] = {}
+                if result and result.get('datatype_overrides'):
+                    try:
+                        result['datatype_overrides'] = json.loads(result['datatype_overrides'])
+                    except:
+                        result['datatype_overrides'] = {}
                 return result
         else:
             async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -338,6 +368,11 @@ class SessionModel:
                             result['column_renames'] = json.loads(result['column_renames'])
                         except:
                             result['column_renames'] = {}
+                    if result and result.get('datatype_overrides'):
+                        try:
+                            result['datatype_overrides'] = json.loads(result['datatype_overrides'])
+                        except:
+                            result['datatype_overrides'] = {}
                     return result
     
     @staticmethod
@@ -498,6 +533,65 @@ class SessionModel:
                     if row and row['column_renames']:
                         try:
                             return json.loads(row['column_renames'])
+                        except:
+                            return {}
+                    return {}
+
+    @staticmethod
+    async def set_datatype_overrides(datatype_overrides: dict):
+        overrides_json = json.dumps(datatype_overrides) if datatype_overrides else None
+
+        if USE_POSTGRES:
+            pool = await get_pg_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT id FROM active_session WHERE id = 1")
+                if row:
+                    await conn.execute(
+                        "UPDATE active_session SET datatype_overrides = $1 WHERE id = 1",
+                        overrides_json
+                    )
+                else:
+                    await conn.execute(
+                        "INSERT INTO active_session (id, datatype_overrides) VALUES (1, $1)",
+                        overrides_json
+                    )
+        else:
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                async with db.execute("SELECT id FROM active_session WHERE id = 1") as cursor:
+                    row = await cursor.fetchone()
+
+                if row:
+                    await db.execute(
+                        "UPDATE active_session SET datatype_overrides = ? WHERE id = 1",
+                        (overrides_json,)
+                    )
+                else:
+                    await db.execute(
+                        "INSERT INTO active_session (id, datatype_overrides) VALUES (1, ?)",
+                        (overrides_json,)
+                    )
+                await db.commit()
+
+    @staticmethod
+    async def get_datatype_overrides():
+        if USE_POSTGRES:
+            pool = await get_pg_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT datatype_overrides FROM active_session WHERE id = 1")
+                if row and row['datatype_overrides']:
+                    try:
+                        return json.loads(row['datatype_overrides'])
+                    except:
+                        return {}
+                return {}
+        else:
+            async with aiosqlite.connect(DATABASE_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute("SELECT datatype_overrides FROM active_session WHERE id = 1") as cursor:
+                    row = await cursor.fetchone()
+                    if row and row['datatype_overrides']:
+                        try:
+                            return json.loads(row['datatype_overrides'])
                         except:
                             return {}
                     return {}

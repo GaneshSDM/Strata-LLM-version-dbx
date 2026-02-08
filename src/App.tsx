@@ -5,6 +5,7 @@ import Login from './pages/Login'
 import Analyze from './pages/Analyze'
 import Extract from './pages/Extract'
 import ViewLogs from './pages/ViewLogs'
+import DataTypes from './pages/DataTypes'
 import { LogsModal } from './components/LogsModal'
 import { ConnectionModal } from './components/ConnectionModal'
 import { Toaster } from './components/ui/toast'
@@ -45,7 +46,7 @@ const isWizardPath = (path: string): path is WizardStepPath => {
 }
 
 const isKnownPath = (path: string) => {
-  return isWizardPath(path) || path === '/logs'
+  return isWizardPath(path) || path === '/logs' || path === '/datatypes'
 }
 
 // Error Boundary Component
@@ -151,6 +152,9 @@ function AuthenticatedContent({
         )}
       </div>
       {pathname === '/logs' && <ViewLogs />}
+      <div hidden={pathname !== '/datatypes'}>
+        <DataTypes />
+      </div>
     </>
   )
 }

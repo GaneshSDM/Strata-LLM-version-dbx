@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, FileText, FileSpreadsheet, FileJson, Database, Table, Eye, Zap, Hash, Box, Lock, Code } from 'lucide-react'
 import { useWizard } from '../components/WizardContext'
@@ -20,6 +20,14 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
   const [sessionInfo, setSessionInfo] = useState<{ sourceType?: string; targetType?: string } | null>(null)
   // New UI flag – when true we ask the backend to execute the translated DDL in the target DB.
   const [runInTarget, setRunInTarget] = useState<boolean>(false)
+  const [datatypeRows, setDatatypeRows] = useState<any[]>([])
+  const [datatypeOverrides, setDatatypeOverrides] = useState<Record<string, string>>({})
+  const [datatypeLoading, setDatatypeLoading] = useState(false)
+  const [datatypeError, setDatatypeError] = useState<string | null>(null)
+  const [structureStatus, setStructureStatus] = useState<any>(null)
+  const [startingStructure, setStartingStructure] = useState(false)
+  const [structureNotification, setStructureNotification] = useState<string | null>(null)
+  const datatypesSignature = useMemo(() => JSON.stringify(datatypeOverrides), [datatypeOverrides])
 
   const startExtraction = async () => {
     await ensureSessionId()
@@ -90,7 +98,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     loadSession()
   }, [])
 
-  const parseJsonResponse = async (res: Response) => {
+  const parseJsonResponse = useCallback(async (res: Response) => {
     const text = await res.text()
     if (!text) {
       return { ok: false, message: `HTTP ${res.status}` }
@@ -99,6 +107,73 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
       return JSON.parse(text)
     } catch {
       return { ok: false, message: text }
+    }
+  }, [])
+  const loadDatatypeMappings = useCallback(async () => {
+    setDatatypeLoading(true)
+    try {
+      const res = await fetch('/api/datatype/mappings')
+      const data = await parseJsonResponse(res)
+      if (data.ok) {
+        setDatatypeRows(data.rows || [])
+        setDatatypeOverrides(data.overrides || {})
+        setDatatypeError(null)
+      } else {
+        setDatatypeError(data.message || 'Unable to load datatype mappings')
+      }
+    } catch (err: any) {
+      setDatatypeError(err?.message || 'Unable to load datatype mappings')
+    } finally {
+      setDatatypeLoading(false)
+    }
+  }, [parseJsonResponse])
+
+  const fetchStructureStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/migrate/structure-status')
+      const data = await parseJsonResponse(res)
+      if (data) {
+        setStructureStatus(data)
+      }
+    } catch {
+      // keep last known status if fetching fails
+    }
+  }, [parseJsonResponse])
+
+  useEffect(() => {
+    loadDatatypeMappings()
+    const handler = () => {
+      loadDatatypeMappings()
+    }
+    window.addEventListener('datatypeOverridesUpdated', handler)
+    return () => window.removeEventListener('datatypeOverridesUpdated', handler)
+  }, [loadDatatypeMappings])
+
+  useEffect(() => {
+    fetchStructureStatus()
+    const interval = setInterval(() => {
+      fetchStructureStatus()
+    }, 2500)
+    return () => clearInterval(interval)
+  }, [fetchStructureStatus])
+
+  const startStructureMigration = async () => {
+    if (structureStatus?.status === 'running') return
+    setStructureNotification(null)
+    setStartingStructure(true)
+    try {
+      const res = await fetch('/api/migrate/structure', {
+        method: 'POST'
+      })
+      const data = await parseJsonResponse(res)
+      if (!data.ok) {
+        setStructureNotification(data.message || 'Unable to start structure migration')
+      }
+      await fetchStructureStatus()
+    } catch (err: any) {
+      setStructureNotification(err?.message || 'Unable to start structure migration')
+    } finally {
+      setStartingStructure(false)
     }
   }
   const fetchTargetDdl = async (params: { cacheKey: string; sourceDdl: string; name?: string; kind?: string; schema?: string }) => {
@@ -116,6 +191,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
           sourceDdl: params.sourceDdl,
           objectName: params.name || params.cacheKey,
           objectKind: params.kind,
+          datatypeOverrides: datatypeOverrides,
           // Pass the execution flag – backend will run the DDL if true.
           execute: runInTarget
         })
@@ -149,7 +225,11 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     const cached = targetDdlCache[key]
     if (cached?.ddl || cached?.loading) return
     fetchTargetDdl({ cacheKey: key, sourceDdl: activeDdl.ddl, name: activeDdl.title })
-  }, [activeDdl, targetDdlCache, sessionInfo])
+  }, [activeDdl, targetDdlCache, sessionInfo, datatypeOverrides])
+
+  useEffect(() => {
+    setTargetDdlCache({})
+  }, [datatypesSignature])
 
   // Automatically pre-convert visible DDLs in the current tab so Target DDL Preview
   // shows up without requiring a button click.
@@ -819,6 +899,68 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
         </>
       )}
 
+      <div className="bg-white rounded-lg shadow border-t-4 border-[#085690] p-6 mb-6">
+        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h3 className="text-lg font-semibold text-[#085690]">Run translated DDL in Databricks</h3>
+            <p className="text-sm text-gray-600">
+              {datatypeLoading
+                ? 'Loading datatype overrides...'
+                : `Active overrides applied: ${Object.keys(datatypeOverrides).length}.`}
+            </p>
+            {!status?.done && (
+              <p className="text-xs text-gray-500 mt-1">
+                Extraction must finish before the target run can start.
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <button
+              onClick={startStructureMigration}
+              disabled={startingStructure || structureStatus?.status === 'running' || !status?.done}
+              className="px-4 py-2 bg-gradient-to-r from-[#ec6225] to-[#ff7a3d] text-white rounded-lg hover:shadow-lg transition-all disabled:opacity-60"
+            >
+              {structureStatus?.status === 'running' || startingStructure
+                ? 'Running in target...'
+                : 'Start target run'}
+            </button>
+            <button
+              onClick={() => navigate('/datatypes')}
+              className="px-4 py-2 border border-[#085690] text-[#085690] rounded-lg hover:bg-[#085690] hover:text-white transition-colors"
+            >
+              Review datatype mappings
+            </button>
+          </div>
+        </div>
+        <div className="mt-4 space-y-2">
+          <div className="flex items-center justify-between text-xs uppercase tracking-wide text-gray-500">
+            <span>Status: {structureStatus?.message || structureStatus?.status || 'Not started'}</span>
+            <span>Phase: {structureStatus?.progress?.phase || 'Waiting'}</span>
+          </div>
+          <div className="w-full h-2 rounded-full bg-gray-200 overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-[#085690] to-[#ec6225]"
+              style={{
+                width: `${Math.min(100, Math.max(0, structureStatus?.progress?.percent ?? 0))}%`
+              }}
+            />
+          </div>
+          {structureNotification && (
+            <p className="text-xs text-rose-600">{structureNotification}</p>
+          )}
+          {datatypeError && (
+            <p className="text-xs text-rose-600">
+              Unable to refresh datatype mappings: {datatypeError}
+            </p>
+          )}
+          {structureStatus?.status === 'error' && (
+            <p className="text-xs text-rose-600">
+              Target execution error: {structureStatus?.error || 'check logs for details'}
+            </p>
+          )}
+        </div>
+      </div>
+
       {activeDdl && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-white rounded-xl shadow-2xl max-w-6xl w-full mx-4 max-h-[80vh] overflow-hidden">
@@ -871,13 +1013,3 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     </div>
   )
 }
-
-
-
-
-
-
-
-
-
-
