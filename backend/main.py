@@ -34,7 +34,8 @@ except ImportError:
     from models import ConnectionModel, SessionModel, RunModel, init_db, USE_POSTGRES, DATABASE_PATH
     from adapters import get_adapter, ADAPTERS
     from encryption import decrypt_credentials, encrypt_credentials
-    from validation import validate_tables
+    from validation import validate_tables, validate_column_renames
+    from datatype_mappings import apply_datatype_overrides, build_mapping_rows
 
 
 def _import_ai_module():
@@ -42,11 +43,23 @@ def _import_ai_module():
     Import the ai module whether this file was loaded as part of the backend package
     or as a standalone module.
     """
-    module_name = f"{__package__}.ai" if __package__ else "ai"
+    # First try the relative import if package is defined
+    if __package__:
+        try:
+            return importlib.import_module(f"{__package__}.ai")
+        except ImportError:
+            pass
+    
+    # Try direct import
     try:
-        return importlib.import_module(module_name)
+        return importlib.import_module("ai")
     except ImportError:
-        # Fallback to plain import when __package__ is not set
+        # Last resort: try to import from current directory
+        import sys
+        import os
+        current_dir = os.path.dirname(__file__)
+        if current_dir not in sys.path:
+            sys.path.insert(0, current_dir)
         return importlib.import_module("ai")
 
 # Set up logging
@@ -947,10 +960,16 @@ async def convert_ddl(req: ConvertDdlRequest):
             return {"ok": False, "message": "sourceDdl is required"}
 
         session = await SessionModel.get_session()
+        logger.info(f"Session data: {session}")
         overrides = req.datatypeOverrides
         if overrides is None:
             overrides = (session or {}).get("datatype_overrides") or {}
         normalized_source = apply_datatype_overrides(req.sourceDdl, overrides)
+        
+        # Log the conversion request for debugging
+        logger.info(f"/api/ddl/convert request: {req.sourceDialect} -> {req.targetDialect}, object: {req.objectName}")
+        logger.info(f"Source DDL length: {len(normalized_source)}")
+        
         ai = _import_ai_module()
         obj = {
             "name": req.objectName or "object",
@@ -961,7 +980,7 @@ async def convert_ddl(req: ConvertDdlRequest):
         # Hard timeout for AI translation so the request never hangs indefinitely.
         ai_timeout_seconds = 30
         translation = None
-        force_fallback = "databricks" in (req.targetDialect or "").lower()
+        force_fallback = False  # Allow AI conversion for all target dialects including Databricks
 
         if not force_fallback:
             try:
@@ -973,6 +992,7 @@ async def convert_ddl(req: ConvertDdlRequest):
                     ),
                     timeout=ai_timeout_seconds,
                 )
+                logger.info(f"AI translation successful, got {len(translation.get('objects', []))} objects")
             except asyncio.TimeoutError:
                 logger.warning(
                     f"/api/ddl/convert timed out after {ai_timeout_seconds}s; falling back to rule-based translation"
@@ -980,14 +1000,26 @@ async def convert_ddl(req: ConvertDdlRequest):
             except Exception as e:
                 # Log but continue to fallback so the UI still receives a response.
                 logger.error(f"/api/ddl/convert AI error: {e}")
+                logger.error(f"Full traceback: {traceback.format_exc()}")
 
         if not isinstance(translation, dict) or not translation.get("objects"):
+            logger.info("Using fallback translation")
+            logger.info(f"Source dialect: {req.sourceDialect}, Target dialect: {req.targetDialect}")
+            logger.info(f"Object data: {obj}")
             translation = ai.fallback_translation(
                 [obj], req.sourceDialect or "", req.targetDialect or ""
             )
+            logger.info(f"Fallback translation result: {len(translation.get('objects', []))} objects")
+            if translation.get("objects"):
+                logger.info(f"First translated object: {translation['objects'][0]}")
 
         translated = (translation.get("objects") or [{}])[0]
         target_sql = translated.get("target_sql", "")
+        
+        # Log the result for debugging
+        logger.info(f"Target SQL generated, length: {len(target_sql)}")
+        if target_sql:
+            logger.info(f"Target SQL preview: {target_sql[:200]}...")
         response = {
             "ok": True,
             "target_sql": target_sql,

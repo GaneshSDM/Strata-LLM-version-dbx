@@ -177,6 +177,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     }
   }
   const fetchTargetDdl = async (params: { cacheKey: string; sourceDdl: string; name?: string; kind?: string; schema?: string }) => {
+    console.log('Starting conversion for:', params.cacheKey);
     setTargetDdlCache(prev => ({
       ...prev,
       [params.cacheKey]: { ddl: prev[params.cacheKey]?.ddl || '', loading: true }
@@ -196,6 +197,12 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
           execute: runInTarget
         })
       })
+      
+      // Check if response is ok before parsing
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`)
+      }
+      
       const data = await parseJsonResponse(res)
         if (data.ok) {
           // Preserve execution status in the cache for UI display.
@@ -203,6 +210,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
             executed: data.executed ?? false,
             execution_error: data.execution_error ?? null
           }
+          console.log('Conversion successful for:', params.cacheKey, 'Target SQL length:', (data.target_sql || '').length);
           setTargetDdlCache(prev => ({
             ...prev,
             [params.cacheKey]: {
@@ -216,6 +224,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
           setTargetDdlCache(prev => ({ ...prev, [params.cacheKey]: { ddl: '', loading: false, error: data.message || 'Conversion failed' } }))
         }
     } catch (err: any) {
+      console.error('Target DDL conversion error for:', params.cacheKey, err)
       setTargetDdlCache(prev => ({ ...prev, [params.cacheKey]: { ddl: '', loading: false, error: err?.message || 'Conversion failed' } }))
     }
   }
@@ -234,7 +243,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
   // Automatically pre-convert visible DDLs in the current tab so Target DDL Preview
   // shows up without requiring a button click.
   useEffect(() => {
-    if (!results?.ddl_scripts) return
+    if (!results?.ddl_scripts || !sessionInfo) return
     const scripts = results.ddl_scripts
     const itemsByTab: Record<string, any[]> = {
       tables: scripts.tables || [],

@@ -11,7 +11,16 @@ try:
     from .encryption import get_fernet_key
 except Exception:
     # Fallback for direct execution contexts
-    from backend.encryption import get_fernet_key  # type: ignore
+    try:
+        from backend.encryption import get_fernet_key  # type: ignore
+    except ImportError:
+        # Last resort: try direct import from current directory
+        import sys
+        import os
+        current_dir = os.path.dirname(__file__)
+        if current_dir not in sys.path:
+            sys.path.insert(0, current_dir)
+        from encryption import get_fernet_key
 
 # Load env vars from both project root .env and backend/.env.
 ROOT_DIR = Path(__file__).resolve().parent.parent
