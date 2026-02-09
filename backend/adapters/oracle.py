@@ -756,150 +756,187 @@ class OracleAdapter(DatabaseAdapter):
             tables = cursor.fetchall()
             
             for owner, table_name in tables:
-                # Generate a basic CREATE TABLE DDL statement
-                table_ddl = f"CREATE TABLE \"{owner}\".\"{table_name}\" (\n"
-                
-                # Get columns for this table
-                col_cursor = connection.cursor()
-                col_cursor.execute(f"""
-                    SELECT column_name, data_type, nullable, data_default, char_length, data_precision, data_scale
-                    FROM all_tab_columns
-                    WHERE owner = '{owner}' AND table_name = '{table_name}'
-                    ORDER BY column_id
-                """)
-                
-                columns = []
-                for col_row in col_cursor.fetchall():
-                    col_name, col_type, nullable, default_val, char_len, precision, scale = col_row
-                    
-                    # Format the column definition
-                    col_def = f"    \"{col_name}\" {col_type}"
-                    
-                    if char_len and 'CHAR' in col_type:
-                        col_def += f"({char_len})"
-                    elif precision is not None and scale is not None and 'NUMBER' in col_type:
-                        col_def += f"({precision}, {scale})"
-                    elif precision is not None and 'NUMBER' in col_type:
-                        col_def += f"({precision})"
-                    
-                    if nullable == 'N':
-                        col_def += " NOT NULL"
-                    
-                    if default_val is not None:
-                        col_def += f" DEFAULT {default_val}"
-                    
-                    columns.append(col_def)
-                
-                col_cursor.close()
-
-                # Get constraints for this table (PK/UK/FK/CHECK)
-                constraint_lines: List[str] = []
+                # Try to use DBMS_METADATA.GET_DDL for accurate, complete DDL extraction
+                table_ddl = None
                 try:
-                    con_cursor = connection.cursor()
+                    ddl_cursor = connection.cursor()
 
-                    # Primary key + unique constraints
-                    con_cursor.execute(f"""
-                        SELECT c.constraint_name,
-                               c.constraint_type,
-                               acc.column_name,
-                               acc.position
-                        FROM all_constraints c
-                        JOIN all_cons_columns acc
-                          ON c.owner = acc.owner
-                         AND c.constraint_name = acc.constraint_name
-                        WHERE c.owner = '{owner}'
-                          AND c.table_name = '{table_name}'
-                          AND c.constraint_type IN ('P','U')
-                        ORDER BY c.constraint_name, acc.position
+                    # Configure DBMS_METADATA for clean output
+                    ddl_cursor.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'STORAGE',false); END;")
+                    ddl_cursor.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'TABLESPACE',false); END;")
+                    ddl_cursor.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'SEGMENT_ATTRIBUTES',false); END;")
+                    ddl_cursor.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'SQLTERMINATOR',true); END;")
+                    ddl_cursor.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'CONSTRAINTS',true); END;")
+                    ddl_cursor.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'REF_CONSTRAINTS',true); END;")
+                    ddl_cursor.execute("BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM,'CONSTRAINTS_AS_ALTER',false); END;")
+
+                    # Get the DDL
+                    ddl_cursor.execute(f"""
+                        SELECT DBMS_METADATA.GET_DDL('TABLE', '{table_name}', '{owner}') FROM DUAL
                     """)
-                    pk_unique_map: Dict[str, Dict[str, Any]] = {}
-                    for cname, ctype, col, _pos in con_cursor.fetchall():
-                        entry = pk_unique_map.setdefault(cname, {"type": ctype, "cols": []})
-                        entry["cols"].append(col)
+                    result = ddl_cursor.fetchone()
+                    if result and result[0]:
+                        # CLOB data needs to be read properly
+                        table_ddl = result[0].read() if hasattr(result[0], 'read') else str(result[0])
+                        # Clean up the DDL
+                        table_ddl = table_ddl.strip()
+                        if not table_ddl.endswith(';'):
+                            table_ddl += ';'
 
-                    for cname, info in pk_unique_map.items():
-                        cols = ", ".join([f"\"{c}\"" for c in info.get("cols", [])])
-                        if not cols:
-                            continue
-                        if info.get("type") == "P":
-                            constraint_lines.append(f"    CONSTRAINT \"{cname}\" PRIMARY KEY ({cols})")
-                        else:
-                            constraint_lines.append(f"    CONSTRAINT \"{cname}\" UNIQUE ({cols})")
-
-                    # Foreign keys
-                    con_cursor.execute(f"""
-                        SELECT c.constraint_name,
-                               acc.column_name,
-                               rc.owner AS r_owner,
-                               rc.table_name AS r_table,
-                               racc.column_name AS r_column,
-                               acc.position
-                        FROM all_constraints c
-                        JOIN all_cons_columns acc
-                          ON c.owner = acc.owner
-                         AND c.constraint_name = acc.constraint_name
-                        JOIN all_constraints rc
-                          ON c.r_owner = rc.owner
-                         AND c.r_constraint_name = rc.constraint_name
-                        JOIN all_cons_columns racc
-                          ON rc.owner = racc.owner
-                         AND rc.constraint_name = racc.constraint_name
-                         AND acc.position = racc.position
-                        WHERE c.owner = '{owner}'
-                          AND c.table_name = '{table_name}'
-                          AND c.constraint_type = 'R'
-                        ORDER BY c.constraint_name, acc.position
-                    """)
-                    fk_map: Dict[str, Dict[str, Any]] = {}
-                    for cname, col, r_owner, r_table, r_col, _pos in con_cursor.fetchall():
-                        entry = fk_map.setdefault(
-                            cname,
-                            {"cols": [], "r_owner": r_owner, "r_table": r_table, "r_cols": []}
-                        )
-                        entry["cols"].append(col)
-                        entry["r_cols"].append(r_col)
-
-                    for cname, info in fk_map.items():
-                        cols = ", ".join([f"\"{c}\"" for c in info.get("cols", [])])
-                        r_cols = ", ".join([f"\"{c}\"" for c in info.get("r_cols", [])])
-                        if cols and r_cols:
-                            constraint_lines.append(
-                                f"    CONSTRAINT \"{cname}\" FOREIGN KEY ({cols}) REFERENCES \"{info['r_owner']}\".\"{info['r_table']}\" ({r_cols})"
-                            )
-
-                    # Check constraints (exclude NOT NULL system checks)
-                    con_cursor.execute(f"""
-                        SELECT constraint_name, search_condition
-                        FROM all_constraints
-                        WHERE owner = '{owner}'
-                          AND table_name = '{table_name}'
-                          AND constraint_type = 'C'
-                    """)
-                    for cname, condition in con_cursor.fetchall():
-                        if not condition:
-                            continue
-                        normalized = str(condition).strip()
-                        upper = normalized.upper()
-                        if "IS NOT NULL" in upper:
-                            continue
-                        if cname.upper().startswith("SYS_"):
-                            continue
-                        constraint_lines.append(
-                            f"    CONSTRAINT \"{cname}\" CHECK ({normalized})"
-                        )
-
-                    con_cursor.close()
-                except Exception:
-                    # Best-effort; skip constraints on any failure
+                    ddl_cursor.close()
+                except Exception as e:
+                    # Fallback to manual DDL construction if DBMS_METADATA fails
+                    print(f"[ORACLE] DBMS_METADATA failed for {owner}.{table_name}: {e}, using fallback")
                     try:
-                        con_cursor.close()
-                    except Exception:
+                        ddl_cursor.close()
+                    except:
                         pass
 
-                all_lines = columns + constraint_lines
-                table_ddl += ",\n".join(all_lines)
-                table_ddl += "\n);"
-                
+                # Fallback: Manual DDL construction (original logic)
+                if not table_ddl:
+                    table_ddl = f"CREATE TABLE \"{owner}\".\"{table_name}\" (\n"
+
+                    # Get columns for this table
+                    col_cursor = connection.cursor()
+                    col_cursor.execute(f"""
+                        SELECT column_name, data_type, nullable, data_default, char_length, data_precision, data_scale
+                        FROM all_tab_columns
+                        WHERE owner = '{owner}' AND table_name = '{table_name}'
+                        ORDER BY column_id
+                    """)
+
+                    columns = []
+                    for col_row in col_cursor.fetchall():
+                        col_name, col_type, nullable, default_val, char_len, precision, scale = col_row
+
+                        # Format the column definition
+                        col_def = f"    \"{col_name}\" {col_type}"
+
+                        if char_len and 'CHAR' in col_type:
+                            col_def += f"({char_len})"
+                        elif precision is not None and scale is not None and 'NUMBER' in col_type:
+                            col_def += f"({precision}, {scale})"
+                        elif precision is not None and 'NUMBER' in col_type:
+                            col_def += f"({precision})"
+
+                        if nullable == 'N':
+                            col_def += " NOT NULL"
+
+                        if default_val is not None:
+                            col_def += f" DEFAULT {default_val}"
+
+                        columns.append(col_def)
+
+                    col_cursor.close()
+
+                    # Get constraints for this table (PK/UK/FK/CHECK)
+                    constraint_lines: List[str] = []
+                    try:
+                        con_cursor = connection.cursor()
+
+                        # Primary key + unique constraints
+                        con_cursor.execute(f"""
+                            SELECT c.constraint_name,
+                                   c.constraint_type,
+                                   acc.column_name,
+                                   acc.position
+                            FROM all_constraints c
+                            JOIN all_cons_columns acc
+                              ON c.owner = acc.owner
+                             AND c.constraint_name = acc.constraint_name
+                            WHERE c.owner = '{owner}'
+                              AND c.table_name = '{table_name}'
+                              AND c.constraint_type IN ('P','U')
+                            ORDER BY c.constraint_name, acc.position
+                        """)
+                        pk_unique_map: Dict[str, Dict[str, Any]] = {}
+                        for cname, ctype, col, _pos in con_cursor.fetchall():
+                            entry = pk_unique_map.setdefault(cname, {"type": ctype, "cols": []})
+                            entry["cols"].append(col)
+
+                        for cname, info in pk_unique_map.items():
+                            cols = ", ".join([f"\"{c}\"" for c in info.get("cols", [])])
+                            if not cols:
+                                continue
+                            if info.get("type") == "P":
+                                constraint_lines.append(f"    CONSTRAINT \"{cname}\" PRIMARY KEY ({cols})")
+                            else:
+                                constraint_lines.append(f"    CONSTRAINT \"{cname}\" UNIQUE ({cols})")
+
+                        # Foreign keys
+                        con_cursor.execute(f"""
+                            SELECT c.constraint_name,
+                                   acc.column_name,
+                                   rc.owner AS r_owner,
+                                   rc.table_name AS r_table,
+                                   racc.column_name AS r_column,
+                                   acc.position
+                            FROM all_constraints c
+                            JOIN all_cons_columns acc
+                              ON c.owner = acc.owner
+                             AND c.constraint_name = acc.constraint_name
+                            JOIN all_constraints rc
+                              ON c.r_owner = rc.owner
+                             AND c.r_constraint_name = rc.constraint_name
+                            JOIN all_cons_columns racc
+                              ON rc.owner = racc.owner
+                             AND rc.constraint_name = racc.constraint_name
+                             AND acc.position = racc.position
+                            WHERE c.owner = '{owner}'
+                              AND c.table_name = '{table_name}'
+                              AND c.constraint_type = 'R'
+                            ORDER BY c.constraint_name, acc.position
+                        """)
+                        fk_map: Dict[str, Dict[str, Any]] = {}
+                        for cname, col, r_owner, r_table, r_col, _pos in con_cursor.fetchall():
+                            entry = fk_map.setdefault(
+                                cname,
+                                {"cols": [], "r_owner": r_owner, "r_table": r_table, "r_cols": []}
+                            )
+                            entry["cols"].append(col)
+                            entry["r_cols"].append(r_col)
+
+                        for cname, info in fk_map.items():
+                            cols = ", ".join([f"\"{c}\"" for c in info.get("cols", [])])
+                            r_cols = ", ".join([f"\"{c}\"" for c in info.get("r_cols", [])])
+                            if cols and r_cols:
+                                constraint_lines.append(
+                                    f"    CONSTRAINT \"{cname}\" FOREIGN KEY ({cols}) REFERENCES \"{info['r_owner']}\".\"{info['r_table']}\" ({r_cols})"
+                                )
+
+                        # Check constraints (exclude NOT NULL system checks)
+                        con_cursor.execute(f"""
+                            SELECT constraint_name, search_condition
+                            FROM all_constraints
+                            WHERE owner = '{owner}'
+                              AND table_name = '{table_name}'
+                              AND constraint_type = 'C'
+                        """)
+                        for cname, condition in con_cursor.fetchall():
+                            if not condition:
+                                continue
+                            normalized = str(condition).strip()
+                            upper = normalized.upper()
+                            if "IS NOT NULL" in upper:
+                                continue
+                            if cname.upper().startswith("SYS_"):
+                                continue
+                            constraint_lines.append(
+                                f"    CONSTRAINT \"{cname}\" CHECK ({normalized})"
+                            )
+
+                        con_cursor.close()
+                    except Exception:
+                        # Best-effort; skip constraints on any failure
+                        try:
+                            con_cursor.close()
+                        except Exception:
+                            pass
+
+                    all_lines = columns + constraint_lines
+                    table_ddl += ",\n".join(all_lines)
+                    table_ddl += "\n);"
+
                 extracted_scripts["tables"].append({
                     "schema": owner,
                     "name": table_name,

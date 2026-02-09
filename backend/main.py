@@ -2595,6 +2595,54 @@ async def run_structure_migration_task():
         translated_objects = translation.get("objects", [])
         create_result = await target_adapter.create_objects(translated_objects)
 
+        # Check for FK handling results and notify user
+        if create_result.get("deferred_fks"):
+            fk_count = create_result.get("deferred_fks_count", len(create_result["deferred_fks"]))
+            _log_event(
+                "structure",
+                f"Info: {fk_count} foreign key constraint(s) were added via ALTER TABLE after table creation "
+                f"to handle self-referencing FKs and dependency ordering.",
+                run_id=session.get("run_id"),
+                session_id=session.get("id"),
+                level="info"
+            )
+
+        if create_result.get("deferred_checks"):
+            check_count = create_result.get("deferred_checks_count", len(create_result["deferred_checks"]))
+            _log_event(
+                "structure",
+                f"Info: {check_count} CHECK constraint(s) were added via ALTER TABLE after table creation.",
+                run_id=session.get("run_id"),
+                session_id=session.get("id"),
+                level="info"
+            )
+
+        if create_result.get("fk_warnings"):
+            fk_count = len(create_result["fk_warnings"])
+            catalog = create_result.get("catalog", "hive_metastore")
+
+            _log_event(
+                "structure",
+                f"Warning: {fk_count} foreign key constraint(s) were stripped because catalog '{catalog}' "
+                f"does not support them. Tables were created successfully without FK constraints. "
+                f"To enable FK support, configure Unity Catalog in your Databricks connection settings.",
+                run_id=session.get("run_id"),
+                session_id=session.get("id"),
+                level="warning"
+            )
+
+        if create_result.get("constraint_warnings"):
+            constraint_count = len(create_result["constraint_warnings"])
+            _log_event(
+                "structure",
+                f"Warning: {constraint_count} CHECK/UNIQUE constraint(s) were stripped. "
+                f"Databricks only supports PRIMARY KEY and FOREIGN KEY constraints in CREATE TABLE. "
+                f"Tables were created successfully without these constraints.",
+                run_id=session.get("run_id"),
+                session_id=session.get("id"),
+                level="warning"
+            )
+
         # Verify Snowflake tables actually exist after creation to avoid false "completed" states.
         try:
             if (target.get("db_type") or "").lower() == "snowflake" and hasattr(target_adapter, "list_columns"):

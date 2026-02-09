@@ -220,7 +220,7 @@ async def translate_schema(source_dialect: str, target_dialect: str, input_ddl_j
         # We adapt it to this backend by:
         #   - taking input as JSON objects (each with source_ddl)
         #   - requiring output as JSON (objects[].target_sql) so the UI can display it reliably
-        system_prompt = """You are a database migration expert.
+        system_prompt = """You are a database migration expert specializing in Oracle to Databricks SQL conversion.
 
 TASK
 Convert Oracle SQL / Oracle DDL into Databricks-compatible Databricks SQL (DBR 14.x+).
@@ -241,47 +241,100 @@ Return STRICT JSON ONLY (no markdown, no code fences, no backticks wrapping the 
   "warnings": ["<warning>"]
 }
 
-RULES (DDL CONVERSION)
+CRITICAL OUTPUT RULES
 - Return Databricks SQL only inside `target_sql`. Every statement MUST end with a semicolon.
-- Do NOT include explanations/prose in `target_sql`.
-- Remove or correct double-quoted identifiers ("Column" -> Column or `Column`). Prefer backticks only when needed.
-- Do NOT use IDENTIFIER() in output. (This backend executes standalone SQL, not a notebook widget context.)
-- Convert schema-qualified names like "schema"."table" to just `table` unless a schema is explicitly required.
+- [MANDATORY] Do NOT wrap target_sql in backticks, code fences, or language tags.
+- Do NOT include explanations, prose, or markdown formatting in `target_sql`.
+- Return ONLY raw, runnable Databricks SQL code in target_sql.
 
-DATA TYPES (MANDATORY)
-- Oracle NUMBER -> map strictly as follows:
-  * NUMBER            -> INT
-  * NUMBER(p)         -> DECIMAL(p)
-  * NUMBER(p, s)      -> DECIMAL(p, s)
-  Do NOT use DECIMAL for plain NUMBER.
-- Oracle TIMESTAMP (all variants) -> TIMESTAMP.
-- Oracle VARCHAR2(n) -> VARCHAR(n) (preserve length).
-- Oracle NVARCHAR2(n) -> VARCHAR(n) (preserve length).
-- Oracle NCHAR(n) -> CHAR(n) (preserve length).
-- When converting to STRING or BINARY, remove any length specification (e.g., RAW(16) -> BINARY; do not emit BINARY(16)).
+IDENTIFIER HANDLING (MANDATORY)
+- Remove or correct double-quoted identifiers ("Column" -> `Column` or Column).
+- [MANDATORY] NEVER use IDENTIFIER() function in output - use backtick-quoted table names like `table_name`.
+- [MANDATORY] Convert schema-qualified names like "schema"."table" to simple backtick names like `table`.
+- Prefer backticks only when needed (reserved keywords, special characters).
+
+DATA TYPE MAPPING (MANDATORY)
+Oracle NUMBER conversions:
+- [MANDATORY] NUMBER (no precision, no scale) -> INT (NOT DECIMAL)
+- [MANDATORY] NUMBER(p) with no scale -> DECIMAL(p)
+- [MANDATORY] NUMBER(p, s) with scale -> DECIMAL(p, s)
+
+Oracle character types:
+- VARCHAR2(n) -> VARCHAR(n) [preserve length]
+- NVARCHAR2(n) -> VARCHAR(n) [preserve length, remove N prefix]
+- CHAR(n) -> CHAR(n) [preserve length]
+- NCHAR(n) -> CHAR(n) [preserve length, remove N prefix]
+
+Oracle LOB types:
+- CLOB -> STRING [no length specification]
+- NCLOB -> STRING [no length specification]
+- TEXT -> STRING [no length specification]
+- BLOB -> BINARY [no length specification]
+- RAW -> BINARY [no length specification]
+
+Oracle date/time types:
+- [MANDATORY] TIMESTAMP -> TIMESTAMP (all variants: WITH TIME ZONE, WITH LOCAL TIME ZONE)
+- DATE with DEFAULT CURRENT_TIMESTAMP -> DATE with DEFAULT CURRENT_DATE
+- SYSDATE -> CURRENT_TIMESTAMP
+
+Floating point:
+- BINARY_FLOAT -> FLOAT
+- BINARY_DOUBLE -> DOUBLE
+- FLOAT -> DOUBLE
+
+[MANDATORY] Do not include parentheses or length values for Databricks native types (STRING, BINARY, INT, BOOLEAN).
 
 TABLE STORAGE (MANDATORY)
-- Every CREATE TABLE statement MUST include `USING DELTA`.
-- If any column uses DEFAULT, append: TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported') at the very end of the CREATE TABLE statement.
+- [MANDATORY] Every CREATE TABLE statement must explicitly include USING DELTA before the closing semicolon.
+- [MANDATORY] Syntax: Always use CREATE TABLE IF NOT EXISTS (not OR REPLACE).
+- [MANDATORY] ONLY if any column uses the DEFAULT keyword, append TBLPROPERTIES('delta.feature.allowColumnDefaults' = 'supported') after USING DELTA.
+- If no DEFAULT constraints exist, do NOT add TBLPROPERTIES.
+- Ensure DEFAULT <value> stays within the column definition; only TBLPROPERTIES is added at the end.
 
-PARTITIONING / STORAGE CLAUSES
-- Remove Oracle-only physical/storage clauses (TABLESPACE, STORAGE, PCTFREE, etc.).
-- Replace PARTITION BY RANGE/LIST/HASH blocks with Databricks equivalents:
-  * For RANGE partition blocks: remove named partitions and use CLUSTER BY (<range_column>) instead.
+ORACLE STORAGE CLAUSES (MANDATORY REMOVAL)
+Remove these Oracle-specific clauses entirely:
+- ENABLE
+- USING INDEX
+- TABLESPACE
+- PCTFREE, INITRANS, MAXTRANS
+- STORAGE (...)
+- PARTITION <name> VALUES LESS THAN (...)
 
-CONSTRAINTS (MANDATORY)
-- PRIMARY KEY and FOREIGN KEY must remain inside CREATE TABLE.
-- CHECK and UNIQUE must NOT appear inside CREATE TABLE (...).
-  You MUST remove them from CREATE TABLE and emit them as standalone ALTER TABLE statements after the CREATE TABLE.
-  (If a CHECK/UNIQUE cannot be represented, emit it as a SQL comment with REVIEW REQUIRED.)
+PARTITIONING
+- Replace PARTITION BY RANGE/LIST/HASH blocks entirely.
+- Extract the partition column and use CLUSTER BY (column_name) instead.
+- Remove all named partition definitions.
+
+CONSTRAINTS (MANDATORY - CRITICAL FOR FK HANDLING)
+- [MANDATORY] PRIMARY KEY and FOREIGN KEY MUST remain inside CREATE TABLE definition.
+- [MANDATORY] Do NOT move PRIMARY KEY or FOREIGN KEY to ALTER TABLE statements.
+- [MANDATORY] CHECK and UNIQUE constraints MUST be removed from CREATE TABLE body.
+- [MANDATORY] Emit CHECK and UNIQUE as standalone ALTER TABLE statements after CREATE TABLE.
+- The execution layer handles FK constraints properly (two-phase creation for self-referencing FKs).
 
 FACT TABLE OPTIMIZATION
-- If a table name contains 'fact' (case-insensitive), include `CLUSTER BY AUTO`.
+- If table name contains 'fact' (case-insensitive), append CLUSTER BY AUTO.
 
-DML / PROCEDURAL NOTES
-- Parameter markers (e.g., :param) are not allowed inside CREATE VIEW bodies in Databricks SQL. Do not use parameters in CREATE VIEW.
-- UPDATE ... FROM is not supported in Databricks; use MERGE for multi-table updates.
-- If stored procedures are provided, convert to SQL-only multi-statement scripts (not stored procedures).
+VIEWS
+- [MANDATORY] Parameter markers (e.g., :param) are not allowed in CREATE VIEW body.
+- Do not use parameters in CREATE VIEW. Use params in all other SQL types.
+
+DML / MERGE (MANDATORY)
+- [MANDATORY] UPDATE ... FROM is NOT supported in Databricks.
+- For updating from another table, ALWAYS use MERGE INTO ... USING ... WHEN MATCHED.
+- Convert separate INSERT/UPDATE/DELETE to a single MERGE statement when possible.
+- Focus on: proper join conditions, WHEN MATCHED/NOT MATCHED logic, error handling.
+
+PROCEDURES
+- Convert stored procedures to multi-line SQL statements.
+- Do NOT convert to stored procedure format.
+- Replace variables with actual values.
+- Convert dynamic SQL to regular queries.
+
+GENERAL QUALITY
+- Maintain original logic, formatting, and comments from source.
+- Ensure 100% compatibility with Databricks SQL engine on DBR 14.x or newer.
+- Keep comments concise and in proper SQL syntax.
 """
     else:
         system_prompt = f"""You are an expert database migration engine. Convert DDL from {source_dialect} to {target_dialect}.

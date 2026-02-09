@@ -245,11 +245,239 @@ def _rewrite_schema_refs(statement: str, target_schema: str) -> str:
     return pattern.sub(_replace, statement)
 
 
+def _contains_foreign_keys(ddl: str) -> bool:
+    """Check if DDL contains foreign key constraints."""
+    import re
+    return bool(re.search(r'\bFOREIGN\s+KEY\b', ddl, flags=re.IGNORECASE))
+
+
+def _strip_foreign_keys(ddl: str) -> tuple[str, list[str]]:
+    """
+    Remove foreign key constraints from DDL.
+
+    Returns:
+        tuple: (cleaned_ddl, removed_fk_list)
+    """
+    import re
+
+    removed_fks = []
+
+    # Pattern to match FK constraints more precisely
+    # Matches: CONSTRAINT name FOREIGN KEY (...) REFERENCES table(col) or FOREIGN KEY (...) REFERENCES table(col)
+    # Captures everything up to and including the referenced columns
+    patterns = [
+        # Named constraint: CONSTRAINT name FOREIGN KEY (...) REFERENCES table(col)
+        r',?\s*CONSTRAINT\s+[`"]?\w+[`"]?\s+FOREIGN\s+KEY\s*\([^)]+\)\s+REFERENCES\s+[^\s(]+\s*\([^)]*\)',
+        # Inline FK: FOREIGN KEY (...) REFERENCES table(col)
+        r',?\s*FOREIGN\s+KEY\s*\([^)]+\)\s+REFERENCES\s+[^\s(]+\s*\([^)]*\)',
+    ]
+
+    cleaned = ddl
+    for pattern in patterns:
+        matches = re.findall(pattern, ddl, flags=re.IGNORECASE | re.DOTALL)
+        for match in matches:
+            removed_fks.append(match.strip())
+            cleaned = re.sub(re.escape(match), '', cleaned, flags=re.IGNORECASE)
+
+    # Clean up extra commas and whitespace
+    cleaned = re.sub(r',\s*,', ',', cleaned)
+    cleaned = re.sub(r',\s*\)', ')', cleaned)
+    cleaned = re.sub(r'\(\s*,', '(', cleaned)
+
+    return cleaned, removed_fks
+
+
+def _extract_check_constraints(ddl: str) -> tuple[str, list[dict]]:
+    """
+    Extract CHECK constraints from DDL to be added via ALTER TABLE.
+
+    Returns:
+        tuple: (cleaned_ddl, list of {constraint_name, check_condition})
+    """
+    import re
+
+    check_constraints = []
+    constraint_counter = 1
+
+    # Helper function to find matching closing parenthesis
+    def find_matching_paren(text, start_pos):
+        count = 1
+        pos = start_pos
+        while pos < len(text) and count > 0:
+            if text[pos] == '(':
+                count += 1
+            elif text[pos] == ')':
+                count -= 1
+            pos += 1
+        return pos if count == 0 else -1
+
+    # Collect all matches first (both named and inline)
+    matches_to_remove = []
+
+    # Find named CHECK constraints: CONSTRAINT name CHECK (...)
+    pattern_named = r',?\s*CONSTRAINT\s+[`"]?(\w+)[`"]?\s+CHECK\s*\('
+    for match in re.finditer(pattern_named, ddl, flags=re.IGNORECASE):
+        constraint_name = match.group(1)
+        start_pos = match.end()
+        end_pos = find_matching_paren(ddl, start_pos)
+
+        if end_pos > 0:
+            condition = ddl[start_pos:end_pos-1]
+            matches_to_remove.append({
+                "start": match.start(),
+                "end": end_pos,
+                "constraint": {
+                    "name": constraint_name,
+                    "condition": condition.strip()
+                }
+            })
+
+    # Find inline CHECK constraints: CHECK (...)
+    pattern_inline = r',?\s*CHECK\s*\('
+    for match in re.finditer(pattern_inline, ddl, flags=re.IGNORECASE):
+        # Skip if this position is already covered by a named constraint
+        if any(m["start"] <= match.start() < m["end"] for m in matches_to_remove):
+            continue
+
+        start_pos = match.end()
+        end_pos = find_matching_paren(ddl, start_pos)
+
+        if end_pos > 0:
+            condition = ddl[start_pos:end_pos-1]
+            matches_to_remove.append({
+                "start": match.start(),
+                "end": end_pos,
+                "constraint": {
+                    "name": f"chk_auto_{constraint_counter}",
+                    "condition": condition.strip()
+                }
+            })
+            constraint_counter += 1
+
+    # Sort by position (reverse order to remove from end to beginning)
+    matches_to_remove.sort(key=lambda x: x["start"], reverse=True)
+
+    # Remove matches from end to beginning and collect constraints
+    cleaned = ddl
+    for match_info in matches_to_remove:
+        check_constraints.insert(0, match_info["constraint"])
+        cleaned = cleaned[:match_info["start"]] + cleaned[match_info["end"]:]
+
+    # Clean up extra commas and whitespace
+    cleaned = re.sub(r',\s*,', ',', cleaned)
+    cleaned = re.sub(r',\s*\)', ')', cleaned)
+    cleaned = re.sub(r'\(\s*,', '(', cleaned)
+
+    return cleaned, check_constraints
+
+
+def _convert_unique_to_column_level(ddl: str) -> tuple[str, list[str]]:
+    """
+    Convert UNIQUE constraints to column-level UNIQUE modifiers.
+    For single-column UNIQUE constraints, add UNIQUE to the column definition.
+    For multi-column UNIQUE constraints, keep them as warnings (not supported inline).
+
+    Returns:
+        tuple: (modified_ddl, list of warnings for multi-column UNIQUE)
+    """
+    import re
+
+    warnings = []
+
+    # Pattern to match UNIQUE constraints
+    # Named UNIQUE: CONSTRAINT name UNIQUE (col1, col2, ...)
+    pattern_named = r',?\s*CONSTRAINT\s+[`"]?(\w+)[`"]?\s+UNIQUE\s*\(([^)]+)\)'
+    # Inline UNIQUE: UNIQUE (col1, col2, ...)
+    pattern_inline = r',?\s*UNIQUE\s*\(([^)]+)\)'
+
+    cleaned = ddl
+
+    # Process named UNIQUE constraints
+    for match in re.finditer(pattern_named, ddl, flags=re.IGNORECASE | re.DOTALL):
+        constraint_name = match.group(1)
+        columns = [col.strip().strip('`"') for col in match.group(2).split(',')]
+
+        if len(columns) == 1:
+            # Single column - add UNIQUE to column definition
+            col_name = columns[0]
+            # Find the column definition and add UNIQUE
+            col_pattern = rf'(`{col_name}`|"{col_name}"|{col_name})\s+([A-Z][A-Z0-9_()]*(?:\([^)]*\))?)'
+            col_match = re.search(col_pattern, cleaned, flags=re.IGNORECASE)
+            if col_match:
+                # Add UNIQUE after the data type
+                replacement = f'{col_match.group(1)} {col_match.group(2)} UNIQUE'
+                cleaned = re.sub(re.escape(col_match.group(0)), replacement, cleaned, count=1)
+        else:
+            # Multi-column UNIQUE - not supported inline, log warning
+            warnings.append(f"Multi-column UNIQUE constraint {constraint_name} on ({', '.join(columns)}) removed")
+
+        # Remove the constraint definition
+        cleaned = re.sub(re.escape(match.group(0)), '', cleaned, count=1)
+
+    # Process inline UNIQUE constraints
+    for match in re.finditer(pattern_inline, ddl, flags=re.IGNORECASE | re.DOTALL):
+        columns = [col.strip().strip('`"') for col in match.group(1).split(',')]
+
+        if len(columns) == 1:
+            # Single column - add UNIQUE to column definition
+            col_name = columns[0]
+            col_pattern = rf'(`{col_name}`|"{col_name}"|{col_name})\s+([A-Z][A-Z0-9_()]*(?:\([^)]*\))?)'
+            col_match = re.search(col_pattern, cleaned, flags=re.IGNORECASE)
+            if col_match:
+                replacement = f'{col_match.group(1)} {col_match.group(2)} UNIQUE'
+                cleaned = re.sub(re.escape(col_match.group(0)), replacement, cleaned, count=1)
+        else:
+            # Multi-column UNIQUE - not supported inline, log warning
+            warnings.append(f"Multi-column UNIQUE constraint on ({', '.join(columns)}) removed")
+
+        # Remove the constraint definition
+        cleaned = re.sub(re.escape(match.group(0)), '', cleaned, count=1)
+
+    # Clean up extra commas and whitespace
+    cleaned = re.sub(r',\s*,', ',', cleaned)
+    cleaned = re.sub(r',\s*\)', ')', cleaned)
+    cleaned = re.sub(r'\(\s*,', '(', cleaned)
+
+    return cleaned, warnings
+
+
 class DatabricksAdapter(DatabaseAdapter):
     def __init__(self, credentials: dict):
         super().__init__(credentials)
         self.driver_available = DRIVER_AVAILABLE
         self.logger = logging.getLogger("strata")
+
+    def _detect_catalog_type(self, connection) -> tuple[str, bool]:
+        """
+        Detect if the configured catalog supports foreign keys.
+
+        Returns:
+            tuple: (catalog_name, supports_fk)
+        """
+        cursor = connection.cursor()
+        try:
+            catalog = self.credentials.get("catalog") or self.credentials.get("catalogName", "hive_metastore")
+
+            # hive_metastore does not support FKs
+            if catalog.lower() == "hive_metastore":
+                return (catalog, False)
+
+            # For other catalogs, verify Unity Catalog by checking information_schema
+            try:
+                cursor.execute(f"USE CATALOG `{catalog}`")
+                cursor.execute("SELECT catalog_name FROM information_schema.catalogs LIMIT 1")
+                cursor.fetchone()
+                return (catalog, True)  # Unity Catalog detected
+            except Exception:
+                return (catalog, False)  # Likely hive_metastore
+        except Exception as e:
+            self.logger.warning(f"[DATABRICKS] Failed to detect catalog type: {e}")
+            return ("hive_metastore", False)
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
 
     def get_connection(self):
         if not self.driver_available:
@@ -1112,13 +1340,21 @@ class DatabricksAdapter(DatabaseAdapter):
                     schema=default_schema
                 )
                 cursor = connection.cursor()
-                
+
+                # Detect catalog type and FK support
+                catalog_name, supports_fk = self._detect_catalog_type(connection)
+                self.logger.info(f"[DATABRICKS] Using catalog: {catalog_name}, FK support: {supports_fk}")
+
                 translated_list = translated_ddl or []
                 attempted_total = len(translated_list)
                 attempted_sql = 0
                 created_count = 0
                 errors: List[Dict[str, Any]] = []
                 skipped: List[Dict[str, Any]] = []
+                fk_warnings: List[Dict[str, Any]] = []
+                deferred_fks: List[Dict[str, Any]] = []  # FKs to add via ALTER TABLE
+                deferred_checks: List[Dict[str, Any]] = []  # CHECK constraints to add via ALTER TABLE
+                constraint_warnings: List[str] = []  # UNIQUE constraint warnings
 
                 for obj in translated_list:
                     ddl = ""  # Initialize ddl to ensure it's always defined
@@ -1134,8 +1370,18 @@ class DatabricksAdapter(DatabaseAdapter):
                             })
                             continue
 
-                        cursor.execute(f"USE CATALOG `{default_catalog}`")
-                        cursor.execute(f"USE SCHEMA `{default_schema}`")
+                        # Ensure we're in the correct catalog/schema context
+                        try:
+                            cursor.execute(f"USE CATALOG `{default_catalog}`")
+                        except Exception as catalog_err:
+                            self.logger.error(f"[DATABRICKS] Failed to USE CATALOG {default_catalog}: {catalog_err}")
+                            raise Exception(f"Cannot use catalog '{default_catalog}': {catalog_err}")
+
+                        try:
+                            cursor.execute(f"USE SCHEMA `{default_schema}`")
+                        except Exception as schema_err:
+                            self.logger.error(f"[DATABRICKS] Failed to USE SCHEMA {default_schema}: {schema_err}")
+                            raise Exception(f"Cannot use schema '{default_schema}': {schema_err}")
 
                         statements = _split_sql_statements(str(raw_ddl))
                         if not statements:
@@ -1154,6 +1400,65 @@ class DatabricksAdapter(DatabaseAdapter):
                             ddl = _rewrite_schema_refs(ddl, default_schema)
                             if not ddl:
                                 continue
+
+                            # Always strip FK constraints from CREATE TABLE to avoid:
+                            # 1. Self-referencing FK errors (table doesn't exist yet)
+                            # 2. FK dependency ordering issues (referenced table doesn't exist yet)
+                            # For Unity Catalog, we'll add them back via ALTER TABLE after all tables are created
+                            if _contains_foreign_keys(ddl):
+                                cleaned_ddl, removed_fks = _strip_foreign_keys(ddl)
+                                if removed_fks:
+                                    if supports_fk:
+                                        # Defer FKs for Unity Catalog - add via ALTER TABLE later
+                                        deferred_fks.append({
+                                            "table": obj.get("name", "unknown"),
+                                            "schema": obj.get("schema", default_schema),
+                                            "fk_constraints": removed_fks
+                                        })
+                                        self.logger.info(
+                                            f"[DATABRICKS] Deferred {len(removed_fks)} FK constraint(s) from "
+                                            f"{obj.get('name', 'unknown')} - will add via ALTER TABLE after table creation"
+                                        )
+                                    else:
+                                        # Warn for hive_metastore - FKs not supported
+                                        fk_warnings.append({
+                                            "table": obj.get("name", "unknown"),
+                                            "schema": obj.get("schema", default_schema),
+                                            "removed_fks": removed_fks
+                                        })
+                                        self.logger.warning(
+                                            f"[DATABRICKS] Stripped {len(removed_fks)} FK constraint(s) from "
+                                            f"{obj.get('name', 'unknown')} (catalog '{catalog_name}' doesn't support FKs)"
+                                        )
+                                ddl = cleaned_ddl
+
+                            # Extract CHECK constraints to add via ALTER TABLE
+                            cleaned_ddl, check_constraints = _extract_check_constraints(ddl)
+                            if check_constraints:
+                                table_name = obj.get('name', 'unknown')
+                                deferred_checks.append({
+                                    "table": table_name,
+                                    "schema": obj.get("schema", default_schema),
+                                    "checks": check_constraints
+                                })
+                                self.logger.info(
+                                    f"[DATABRICKS] Extracted {len(check_constraints)} CHECK constraint(s) from "
+                                    f"{table_name} - will add via ALTER TABLE after table creation"
+                                )
+                                ddl = cleaned_ddl
+
+                            # Convert UNIQUE constraints to column-level UNIQUE
+                            cleaned_ddl, unique_warnings = _convert_unique_to_column_level(ddl)
+                            if unique_warnings:
+                                table_name = obj.get('name', 'unknown')
+                                constraint_warnings.extend([f"{table_name}: {w}" for w in unique_warnings])
+                                self.logger.warning(
+                                    f"[DATABRICKS] {len(unique_warnings)} multi-column UNIQUE constraint(s) removed from "
+                                    f"{table_name} - not supported in Databricks"
+                                )
+                                ddl = cleaned_ddl
+
+                            self.logger.info(f"[DATABRICKS] Executing DDL for {obj.get('name', 'unknown')}: {ddl[:200]}...")
                             cursor.execute(ddl)
 
                         created_count += 1
@@ -1171,7 +1476,85 @@ class DatabricksAdapter(DatabaseAdapter):
                             "original_ddl": original_ddl
                         })
                         continue
-                
+
+                # Phase 2: Add deferred FK constraints via ALTER TABLE (Unity Catalog only)
+                if supports_fk and deferred_fks:
+                    self.logger.info(f"[DATABRICKS] Adding {len(deferred_fks)} deferred FK constraint(s) via ALTER TABLE...")
+                    fk_add_errors = 0
+
+                    for fk_info in deferred_fks:
+                        table_name = fk_info.get("table", "unknown")
+                        table_schema = fk_info.get("schema", default_schema)
+                        fk_constraints = fk_info.get("fk_constraints", [])
+
+                        for fk_constraint in fk_constraints:
+                            try:
+                                # Parse the FK constraint to extract the necessary parts
+                                # Example: "CONSTRAINT `FK_NAME` FOREIGN KEY (`col`) REFERENCES `table`(`ref_col`)"
+                                # We need to convert this to: ALTER TABLE `table` ADD CONSTRAINT ...
+
+                                # Clean up the constraint (remove leading comma/whitespace)
+                                fk_constraint_cleaned = fk_constraint.strip().lstrip(',').strip()
+
+                                # Build ALTER TABLE statement
+                                alter_stmt = (
+                                    f"ALTER TABLE `{table_name}` ADD {fk_constraint_cleaned}"
+                                )
+
+                                self.logger.info(f"[DATABRICKS] Adding FK to {table_name}: {alter_stmt[:150]}...")
+                                cursor.execute(alter_stmt)
+
+                            except Exception as fk_err:
+                                fk_add_errors += 1
+                                self.logger.warning(
+                                    f"[DATABRICKS] Failed to add FK constraint to {table_name}: {fk_err}"
+                                )
+                                # Don't fail the entire migration if FK addition fails
+                                # Just log it and continue
+
+                    if fk_add_errors > 0:
+                        self.logger.warning(
+                            f"[DATABRICKS] {fk_add_errors} FK constraint(s) could not be added. "
+                            f"Tables were created successfully but some FK constraints are missing."
+                        )
+
+                # Phase 3: Add deferred CHECK constraints via ALTER TABLE
+                if deferred_checks:
+                    self.logger.info(f"[DATABRICKS] Adding {len(deferred_checks)} deferred CHECK constraint(s) via ALTER TABLE...")
+                    check_add_errors = 0
+
+                    for check_info in deferred_checks:
+                        table_name = check_info.get("table", "unknown")
+                        table_schema = check_info.get("schema", default_schema)
+                        check_constraints = check_info.get("checks", [])
+
+                        for check_constraint in check_constraints:
+                            try:
+                                constraint_name = check_constraint.get("name")
+                                condition = check_constraint.get("condition")
+
+                                # Build ALTER TABLE statement
+                                alter_stmt = (
+                                    f"ALTER TABLE `{table_name}` ADD CONSTRAINT `{constraint_name}` CHECK ({condition})"
+                                )
+
+                                self.logger.info(f"[DATABRICKS] Adding CHECK to {table_name}: {alter_stmt[:150]}...")
+                                cursor.execute(alter_stmt)
+
+                            except Exception as check_err:
+                                check_add_errors += 1
+                                self.logger.warning(
+                                    f"[DATABRICKS] Failed to add CHECK constraint to {table_name}: {check_err}"
+                                )
+                                # Don't fail the entire migration if CHECK addition fails
+                                # Just log it and continue
+
+                    if check_add_errors > 0:
+                        self.logger.warning(
+                            f"[DATABRICKS] {check_add_errors} CHECK constraint(s) could not be added. "
+                            f"Tables were created successfully but some CHECK constraints are missing."
+                        )
+
                 connection.commit()
                 cursor.close()
                 connection.close()
@@ -1181,8 +1564,20 @@ class DatabricksAdapter(DatabaseAdapter):
                     "ok": len(all_errors) == 0,
                     "created": created_count,
                     "attempted": attempted_total,
-                    "attempted_sql": attempted_sql
+                    "attempted_sql": attempted_sql,
+                    "catalog": catalog_name,
+                    "supports_fk": supports_fk
                 }
+                if deferred_fks:
+                    result["deferred_fks"] = deferred_fks
+                    result["deferred_fks_count"] = len(deferred_fks)
+                if deferred_checks:
+                    result["deferred_checks"] = deferred_checks
+                    result["deferred_checks_count"] = len(deferred_checks)
+                if fk_warnings:
+                    result["fk_warnings"] = fk_warnings
+                if constraint_warnings:
+                    result["constraint_warnings"] = constraint_warnings
                 if skipped:
                     result["skipped"] = skipped
                 if all_errors:
@@ -1470,25 +1865,35 @@ class DatabricksAdapter(DatabaseAdapter):
             connection = self.get_connection()
             cursor = connection.cursor()
 
+            # Detect catalog type and FK support
+            catalog_name, supports_fk = self._detect_catalog_type(connection)
+            self.logger.info(f"[DATABRICKS] run_ddl using catalog: {catalog_name}, FK support: {supports_fk}")
+
             # Ensure we're in the configured catalog/schema for the connection.
             default_catalog = self.credentials.get("catalog") or self.credentials.get("catalogName", "hive_metastore")
             default_schema = self.credentials.get("schema") or self.credentials.get("schemaName", "default")
+
             # Ensure catalog/schema exist and are active.
+            # Don't silently ignore catalog errors - surface them to the user
             try:
                 cursor.execute(f"USE CATALOG `{default_catalog}`")
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"[DATABRICKS] Could not use catalog {default_catalog}: {e}")
+
             try:
                 cursor.execute(f"CREATE SCHEMA IF NOT EXISTS `{default_schema}`")
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"[DATABRICKS] Could not create schema {default_schema}: {e}")
+
             try:
                 cursor.execute(f"USE SCHEMA `{default_schema}`")
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.warning(f"[DATABRICKS] Could not use schema {default_schema}: {e}")
 
             statements = _split_sql_statements(ddl)
             results: List[Dict[str, Any]] = []
+            fk_warnings: List[str] = []
+            constraint_warnings: List[str] = []
 
             for idx, stmt in enumerate(statements):
                 stmt_text = str(stmt or "").strip()
@@ -1497,6 +1902,28 @@ class DatabricksAdapter(DatabaseAdapter):
                 # Normalize and rewrite to increase success rate on Databricks
                 normalized = _normalize_ddl_for_databricks(stmt_text)
                 stmt_to_run = _rewrite_schema_refs(normalized, default_schema)
+
+                # Strip FK constraints if catalog doesn't support them
+                if not supports_fk and _contains_foreign_keys(stmt_to_run):
+                    cleaned_ddl, removed_fks = _strip_foreign_keys(stmt_to_run)
+                    if removed_fks:
+                        fk_warnings.extend(removed_fks)
+                        self.logger.warning(
+                            f"[DATABRICKS] Stripped {len(removed_fks)} FK constraint(s) from statement "
+                            f"(catalog '{catalog_name}' doesn't support FKs)"
+                        )
+                    stmt_to_run = cleaned_ddl
+
+                # Strip CHECK and UNIQUE constraints (Databricks only supports PK and FK inline)
+                cleaned_ddl, removed_constraints = _strip_check_and_unique_constraints(stmt_to_run)
+                if removed_constraints:
+                    constraint_warnings.extend(removed_constraints)
+                    self.logger.warning(
+                        f"[DATABRICKS] Stripped {len(removed_constraints)} CHECK/UNIQUE constraint(s) from statement "
+                        f"- Databricks only supports PK and FK in CREATE TABLE"
+                    )
+                    stmt_to_run = cleaned_ddl
+
                 try:
                     cursor.execute(stmt_to_run)
                     results.append({
@@ -1524,11 +1951,18 @@ class DatabricksAdapter(DatabaseAdapter):
             connection.close()
 
             first_error = next((r.get("error") for r in results if not r.get("ok")), None)
-            return {
+            result = {
                 "ok": ok,
                 "statements": results,
-                "error": first_error
+                "error": first_error,
+                "catalog": catalog_name,
+                "supports_fk": supports_fk
             }
+            if fk_warnings:
+                result["fk_warnings"] = fk_warnings
+            if constraint_warnings:
+                result["constraint_warnings"] = constraint_warnings
+            return result
         except Exception as e:
             return {"ok": False, "error": str(e), "statements": []}
 
