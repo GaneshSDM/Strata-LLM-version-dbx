@@ -359,7 +359,13 @@ CRITICAL RULES:
    - DATE → DATE
    - BOOL → BOOLEAN
 3. Keep column names EXACTLY as in source (case-sensitive)
-4. Preserve all constraints, indexes, and relationships
+4. CONSTRAINT HANDLING (MANDATORY):
+   - PRIMARY KEY and FOREIGN KEY constraints MUST remain in CREATE TABLE definition
+   - CHECK constraints MUST be moved to separate ALTER TABLE ADD CONSTRAINT statements
+   - UNIQUE constraints MUST be completely removed from output (do not create any ALTER TABLE statements for UNIQUE constraints) as Databricks Delta tables do not enforce them
+   - Remove Oracle-specific syntax: ENABLE, USING INDEX, USING INDEX ENABLE
+   - For Databricks: Use backticks for identifiers, add USING DELTA
+5. Preserve all constraints, indexes, and relationships
 
 Output strictly valid JSON:
 {{
@@ -367,7 +373,7 @@ Output strictly valid JSON:
     {{
       "name": "TableName",
       "kind": "table",
-      "target_sql": "CREATE TABLE TableName (col1 TYPE, col2 TYPE, ...);",
+      "target_sql": "CREATE TABLE `TableName` (col1 TYPE, col2 TYPE, ...) USING DELTA;",
       "notes": ["conversion notes"]
     }}
   ],
@@ -692,11 +698,47 @@ def fallback_translation(objects_list: list, source_dialect: str, target_dialect
             # Clean up trailing semicolons.
             target_ddl = target_ddl.strip().rstrip(';') + ';'
 
+            # CONSTRAINT HANDLING - Match prompt behavior exactly
+            # Extract CHECK constraints and move to ALTER TABLE statements
+            # Remove UNIQUE constraints entirely (don't create ALTER TABLE for them)
+            import re
+            
+            # Extract table name
+            table_match = re.search(r'CREATE\s+TABLE\s+[`"]?([^`"\s(]+)[`"]?', target_ddl, re.IGNORECASE)
+            if table_match:
+                table_name = table_match.group(1)
+                
+                # Extract CHECK constraints
+                check_pattern = r'CHECK\s*\([^)]+\)'
+                check_matches = re.findall(check_pattern, target_ddl, re.IGNORECASE)
+                
+                # Extract UNIQUE constraints
+                unique_pattern = r'UNIQUE\s*\([^)]+\)'
+                unique_matches = re.findall(unique_pattern, target_ddl, re.IGNORECASE)
+                
+                # Remove all constraints from CREATE TABLE
+                target_ddl = re.sub(r',?\s*(CHECK|UNIQUE)\s*\([^)]+\)', '', target_ddl, flags=re.IGNORECASE)
+                target_ddl = re.sub(r'\s+', ' ', target_ddl)  # Clean up extra spaces
+                target_ddl = re.sub(r'\s*,\s*\)', ')', target_ddl)  # Clean up trailing commas
+                target_ddl = re.sub(r'\(\s*,', '(', target_ddl)  # Clean up leading commas
+                
+                # Add ALTER TABLE statements for CHECK constraints only
+                alter_statements = []
+                for i, check_constraint in enumerate(check_matches, 1):
+                    constraint_name = f"chk_{table_name}_check_{i}".lower()
+                    alter_statements.append(f"ALTER TABLE `{table_name}` ADD CONSTRAINT `{constraint_name}` {check_constraint};")
+                
+                # Combine CREATE TABLE with ALTER TABLE statements
+                if alter_statements:
+                    target_ddl = target_ddl + "\n\n" + "\n".join(alter_statements)
+            
             notes = [
                 f"Fallback translation from {source_dialect} to {target_dialect}",
                 "Aligned NUMBER mapping to INT/DECIMAL per enterprise rules",
                 "Preserved VARCHAR/CHAR lengths",
-                "Added USING DELTA to CREATE TABLE"
+                "Added USING DELTA to CREATE TABLE",
+                "Moved CHECK constraints to ALTER TABLE statements per prompt requirements",
+                "Removed UNIQUE constraints entirely as Databricks does not enforce them"
             ]
         elif ("postgres" in source_dialect.lower()) and ("snowflake" in target_dialect.lower()):
             # Convert PostgreSQL DDL to Snowflake DDL (minimal, focusing on common Postgres features).
