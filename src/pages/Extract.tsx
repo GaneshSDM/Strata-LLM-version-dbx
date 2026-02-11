@@ -27,6 +27,8 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
   const [structureStatus, setStructureStatus] = useState<any>(null)
   const [startingStructure, setStartingStructure] = useState(false)
   const [structureNotification, setStructureNotification] = useState<string | null>(null)
+  const [autoTriggerState, setAutoTriggerState] = useState<'preparing' | 'triggered' | 'idle'>('preparing')
+  const [autoTriggerCountdown, setAutoTriggerCountdown] = useState(8)
   const datatypesSignature = useMemo(() => JSON.stringify(datatypeOverrides), [datatypeOverrides])
 
   const startExtraction = async () => {
@@ -81,7 +83,52 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     setStatus(null)
     setActiveTab('overview')
     setHasReportedCompletion(false)
+    // Reset auto-trigger state
+    setAutoTriggerState('preparing')
+    setAutoTriggerCountdown(8)
   }, [wizardResetId])
+
+  // Auto-trigger extraction after component mount
+  useEffect(() => {
+    // Ensures auto-trigger happens only on first arrival to this page
+    // Only auto-trigger if:
+    // 1. Not already extracting
+    // 2. No status exists (not a re-run)
+    // 3. autoTriggerState is still 'preparing'
+    if (extracting || status?.done || autoTriggerState !== 'preparing') {
+      return
+    }
+
+    // Countdown interval (updates UI every second)
+    const countdownInterval = setInterval(() => {
+      setAutoTriggerCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(countdownInterval)
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+
+    // Auto-trigger timeout (8 seconds)
+    const autoTriggerTimeout = setTimeout(() => {
+      if (!extracting && !status?.done) {
+        startExtraction()
+        setAutoTriggerState('triggered')
+      }
+    }, 8000)
+
+    // Cleanup function prevents memory leaks
+    return () => {
+      clearInterval(countdownInterval)
+      clearTimeout(autoTriggerTimeout)
+    }
+  }, []) // Empty dependency array = run once on mount
+
+  // Scroll to top on page load
+  useEffect(() => {
+    window.scrollTo(0, 0)
+  }, [])
 
   useEffect(() => {
     const loadSession = async () => {
@@ -386,11 +433,14 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
       <div className="bg-white rounded-lg shadow p-6 mb-6 border-t-4 border-[#ec6225]">
         <div className="flex gap-3 items-center flex-wrap">
           <button
-            onClick={startExtraction}
-            disabled={extracting}
-            className="btn-primary shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={true}
+            className="btn-primary shadow-lg opacity-50 cursor-not-allowed"
           >
-            {extracting ? 'Extracting...' : status?.done ? 'Re-run Extraction' : 'Start Extraction'}
+            {autoTriggerState === 'preparing'
+              ? `Preparing Extraction... (${autoTriggerCountdown}s)`
+              : status?.done
+              ? 'Completed'
+              : 'Auto Extraction in Progress...'}
           </button>
 
           {status && status.done && (
