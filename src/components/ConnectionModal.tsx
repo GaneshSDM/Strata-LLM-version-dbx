@@ -258,9 +258,66 @@ schema:`
     }
   }
 
+  const validateCredentials = (dbType: string, creds: any): string | null => {
+    // Validate required fields for each database type
+    switch (dbType) {
+      case 'Databricks':
+        if (!creds.server_hostname || !creds.server_hostname.trim()) {
+          return 'Server hostname is required'
+        }
+        if (!creds.http_path || !creds.http_path.trim()) {
+          return 'HTTP path is required'
+        }
+        if (!creds.access_token || !creds.access_token.trim()) {
+          return 'Access token is required'
+        }
+        break
+      case 'MySQL':
+        if (!creds.host || !creds.host.trim()) {
+          return 'Host is required'
+        }
+        if (!creds.username || !creds.username.trim()) {
+          return 'Username is required'
+        }
+        break
+      case 'Oracle':
+        if (!creds.host || !creds.host.trim()) {
+          return 'Host is required'
+        }
+        if (!creds.service_name || !creds.service_name.trim()) {
+          return 'Service name is required'
+        }
+        if (!creds.username || !creds.username.trim()) {
+          return 'Username is required'
+        }
+        break
+      case 'Snowflake':
+        if (!creds.account || !creds.account.trim()) {
+          return 'Account is required'
+        }
+        if (!creds.username || !creds.username.trim()) {
+          return 'Username is required'
+        }
+        if (!creds.warehouse || !creds.warehouse.trim()) {
+          return 'Warehouse is required'
+        }
+        break
+    }
+    return null
+  }
+
   const testConnection = async () => {
     setTesting(true)
     setTestMessage(null)
+
+    // Validate credentials before sending
+    const validationError = validateCredentials(dbType, credentials)
+    if (validationError) {
+      setTestMessage({ type: 'error', text: validationError })
+      setTesting(false)
+      return
+    }
+
     try {
       const normalizedCreds = normalizeCredentialsForDb(dbType, credentials)
       const res = await fetch('/api/connections/test', {
@@ -277,7 +334,7 @@ schema:`
       }
     } catch (err) {
       console.error('Connection test failed:', err)
-      setTestMessage({ type: 'error', text: 'Connection test failed' })
+      setTestMessage({ type: 'error', text: 'Failed to connect to backend server. Please ensure the backend is running.' })
     } finally {
       setTesting(false)
     }

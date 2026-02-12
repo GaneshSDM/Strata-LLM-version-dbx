@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, FileText, FileSpreadsheet, FileJson, Database, Table, Eye, Zap, Hash, Box, Lock, Code } from 'lucide-react'
+import { useNavigate, useLocation } from 'react-router-dom'
+import { ArrowLeft, FileText, FileSpreadsheet, FileJson, Database, Table, Eye, Zap, Hash, Box, Lock, Code, RefreshCw } from 'lucide-react'
 import { useWizard } from '../components/WizardContext'
 import { ensureSessionId, getSessionHeaders } from '../utils/session'
 
@@ -10,7 +10,9 @@ type ExtractProps = {
 
 export default function Extract({ onExtractionComplete }: ExtractProps) {
   const navigate = useNavigate()
-  const { wizardResetId } = useWizard()
+  const location = useLocation()
+  const isVisible = location.pathname === '/extract'
+  const { wizardResetId, analyzeMetrics } = useWizard()
   const [extracting, setExtracting] = useState(false)
   const [status, setStatus] = useState<any>(null)
   const [activeTab, setActiveTab] = useState('overview')
@@ -27,6 +29,8 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
   const [structureStatus, setStructureStatus] = useState<any>(null)
   const [startingStructure, setStartingStructure] = useState(false)
   const [structureNotification, setStructureNotification] = useState<string | null>(null)
+  const [autoTriggerState, setAutoTriggerState] = useState<'preparing' | 'triggered' | 'idle'>('preparing')
+  const [autoTriggerCountdown, setAutoTriggerCountdown] = useState(8)
   const datatypesSignature = useMemo(() => JSON.stringify(datatypeOverrides), [datatypeOverrides])
 
   const startExtraction = async () => {
@@ -59,7 +63,11 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
   }
 
   const results = status?.results
-  const summary = results?.extraction_summary || {}
+  const backendSummary = results?.extraction_summary || {}
+  // Use analyze-page filtered metrics when available, falling back to backend summary
+  const summary = analyzeMetrics
+    ? { ...backendSummary, ...analyzeMetrics }
+    : backendSummary
   const extractionSteps = [
     { label: 'Connecting to source', start: 0, end: 10 },
     { label: 'Reading schema metadata', start: 10, end: 35 },
@@ -81,7 +89,53 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     setStatus(null)
     setActiveTab('overview')
     setHasReportedCompletion(false)
+    // Reset auto-trigger state
+    setAutoTriggerState('preparing')
+    setAutoTriggerCountdown(8)
   }, [wizardResetId])
+
+  // Auto-trigger extraction only when the page is actually visible
+  useEffect(() => {
+    if (!isVisible) return
+    if (extracting || status?.done || autoTriggerState !== 'preparing') return
+
+    setAutoTriggerCountdown(8)
+
+    // Countdown interval (updates UI every second)
+    const countdownInterval = setInterval(() => {
+      setAutoTriggerCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(countdownInterval)
+          return 0
+        }
+        return prev - 1
+      })
+    }, 1000)
+
+    // Auto-trigger timeout (8 seconds)
+    const autoTriggerTimeout = setTimeout(() => {
+      startExtraction()
+      setAutoTriggerState('triggered')
+    }, 8000)
+
+    // Cleanup function prevents memory leaks
+    return () => {
+      clearInterval(countdownInterval)
+      clearTimeout(autoTriggerTimeout)
+    }
+  }, [isVisible]) // Only trigger when page becomes visible
+
+  // Scroll to top when Extract page becomes visible
+  useEffect(() => {
+    if (isVisible) {
+      // The scrollable container is the <main> element in Layout, not the window
+      const mainEl = document.querySelector('main')
+      if (mainEl) {
+        mainEl.scrollTo(0, 0)
+      }
+      window.scrollTo(0, 0)
+    }
+  }, [isVisible])
 
   useEffect(() => {
     const loadSession = async () => {
@@ -386,12 +440,29 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
       <div className="bg-white rounded-lg shadow p-6 mb-6 border-t-4 border-[#ec6225]">
         <div className="flex gap-3 items-center flex-wrap">
           <button
-            onClick={startExtraction}
-            disabled={extracting}
-            className="btn-primary shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={true}
+            className="btn-primary shadow-lg opacity-50 cursor-not-allowed"
           >
-            {extracting ? 'Extracting...' : status?.done ? 'Re-run Extraction' : 'Start Extraction'}
+            {autoTriggerState === 'preparing'
+              ? `Preparing Extraction... (${autoTriggerCountdown}s)`
+              : status?.done
+              ? 'Completed'
+              : 'Auto Extraction in Progress...'}
           </button>
+
+          {status?.done && (
+            <button
+              onClick={() => {
+                setStatus(null)
+                startExtraction()
+                setAutoTriggerState('triggered')
+              }}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg border-2 border-[#085690] text-[#085690] bg-white hover:bg-[#085690] hover:text-white transition-all font-medium"
+            >
+              <RefreshCw size={18} />
+              Re-Extract
+            </button>
+          )}
 
           {status && status.done && (
             <>
@@ -503,7 +574,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
         </div>
       )}
 
-      {status && status.done && results && (
+      {((status && status.done && results) || analyzeMetrics) && (
         <>
           <div className="grid grid-cols-4 gap-4 mb-6">
             <MetricCard icon={Database} label="User Types" value={summary.user_types} color="#085690" />
@@ -525,7 +596,11 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
             <MetricCard icon={Lock} label="Grants" value={summary.grants} color="#085690" />
             <MetricCard icon={Box} label="Validation Scripts" value={summary.validation_scripts} color="#ec6225" />
           </div>
+        </>
+      )}
 
+      {status && status.done && results && (
+        <>
           <div className="bg-white rounded-lg shadow border-t-4 border-[#085690]">
             <div className="border-b border-gray-200">
               <div className="flex gap-1 p-2 overflow-x-auto">

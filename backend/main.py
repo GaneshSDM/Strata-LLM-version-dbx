@@ -505,6 +505,7 @@ def _sanitize_credentials(db_type: str, credentials: Any) -> Dict[str, Any]:
     Keep credentials shape stable between UI and adapters.
 
     For Oracle we intentionally support *thin-mode only* via UI: no SYSDBA/SYSOPER role fields.
+    For Databricks, normalize field names to match what frontend sends.
     """
     if not isinstance(credentials, dict):
         return {}
@@ -518,6 +519,32 @@ def _sanitize_credentials(db_type: str, credentials: Any) -> Dict[str, Any]:
             cleaned["service_name"] = credentials.get("serviceName")
         if "schema" not in cleaned and "schema_name" in credentials:
             cleaned["schema"] = credentials.get("schema_name")
+
+        return cleaned
+
+    if (db_type or "").strip().lower() == "databricks":
+        # Normalize Databricks credentials - ensure consistent field names
+        cleaned: Dict[str, Any] = {}
+
+        # Server hostname (frontend sends server_hostname, backend prefers it too)
+        cleaned["server_hostname"] = credentials.get("server_hostname") or credentials.get("host") or ""
+
+        # HTTP path (frontend sends http_path)
+        cleaned["http_path"] = credentials.get("http_path") or credentials.get("httpPath") or ""
+
+        # Access token (frontend sends access_token)
+        cleaned["access_token"] = credentials.get("access_token") or credentials.get("accessToken") or ""
+
+        # Catalog (optional, defaults to hive_metastore)
+        cleaned["catalog"] = credentials.get("catalog") or credentials.get("catalogName") or ""
+
+        # Schema (optional, defaults to default)
+        cleaned["schema"] = credentials.get("schema") or credentials.get("schemaName") or ""
+
+        # Strip whitespace from all fields
+        for key in cleaned:
+            if isinstance(cleaned[key], str):
+                cleaned[key] = cleaned[key].strip()
 
         return cleaned
 
@@ -1600,9 +1627,27 @@ async def run_analysis_task():
                     continue
                 full_name = f"{schema}.{name}" if schema else name
                 table_names.append(full_name)
+
+            # Get detailed counts for all analyzed objects
+            constraints_count = len(analysis_result.get("constraints", []))
+            indexes_count = len(analysis_result.get("indexes", []))
+            triggers_count = len(analysis_result.get("triggers", []))
+            sequences_count = len(analysis_result.get("sequences", []))
+            views_count = len(analysis_result.get("views", []))
+            procedures_count = len(analysis_result.get("procedures", []))
+            columns_count = len(analysis_result.get("columns", []))
+
+            # Create detailed log message
+            details_msg = (
+                f"tables={len(table_names)}, columns={columns_count}, "
+                f"constraints={constraints_count}, indexes={indexes_count}, "
+                f"triggers={triggers_count}, sequences={sequences_count}, "
+                f"views={views_count}, procedures={procedures_count}"
+            )
+
             _log_event(
                 "ANALYSIS",
-                f"Analysis completed tables={len(table_names)}",
+                f"Analysis completed: {details_msg}",
                 run_id=run_id,
                 tables=table_names
             )
@@ -2040,24 +2085,33 @@ async def run_extraction_task():
         except Exception:
             pass
 
-        # Build extraction summary/object counts so UI never shows zeros when data exists
-        ddl_scripts = extraction_result.get("ddl_scripts", {})
+        # Build extraction summary from analysis results (not DDL scripts)
+        # This ensures metrics match between Analyze and Extract pages
+        analysis_results = analysis_state.get("results", {})
         extraction_summary = extraction_result.get("extraction_summary", {})
 
+        # Debug: Print what we're getting from analysis
+        print(f"[EXTRACTION] Analysis constraints count: {len(analysis_results.get('constraints', []))}")
+        print(f"[EXTRACTION] DDL constraints count: {len(extraction_result.get('ddl_scripts', {}).get('constraints', []))}")
+
+        # Use analysis counts if available, otherwise fallback to DDL script counts
+        ddl_scripts = extraction_result.get("ddl_scripts", {})
         extraction_summary.update({
-            "user_types": len(ddl_scripts.get("user_types", [])),
-            "sequences": len(ddl_scripts.get("sequences", [])),
-            "tables": len(ddl_scripts.get("tables", [])),
-            "indexes": len(ddl_scripts.get("indexes", [])),
-            "views": len(ddl_scripts.get("views", [])),
-            "materialized_views": len(ddl_scripts.get("materialized_views", [])),
-            "triggers": len(ddl_scripts.get("triggers", [])),
-            "procedures": len(ddl_scripts.get("procedures", [])),
-            "functions": len(ddl_scripts.get("functions", [])),
-            "constraints": len(ddl_scripts.get("constraints", [])),
-            "grants": len(ddl_scripts.get("grants", [])),
+            "user_types": len(analysis_results.get("user_types", [])) or len(ddl_scripts.get("user_types", [])),
+            "sequences": len(analysis_results.get("sequences", [])) or len(ddl_scripts.get("sequences", [])),
+            "tables": len(analysis_results.get("tables", [])) or len(ddl_scripts.get("tables", [])),
+            "indexes": len(analysis_results.get("indexes", [])) or len(ddl_scripts.get("indexes", [])),
+            "views": len(analysis_results.get("views", [])) or len(ddl_scripts.get("views", [])),
+            "materialized_views": len(analysis_results.get("materialized_views", [])) or len(ddl_scripts.get("materialized_views", [])),
+            "triggers": len(analysis_results.get("triggers", [])) or len(ddl_scripts.get("triggers", [])),
+            "procedures": len(analysis_results.get("procedures", [])) or len(ddl_scripts.get("procedures", [])),
+            "functions": len(analysis_results.get("functions", [])) or len(ddl_scripts.get("functions", [])),
+            "constraints": len(analysis_results.get("constraints", [])) or len(ddl_scripts.get("constraints", [])),
+            "grants": len(analysis_results.get("grants", [])) or len(ddl_scripts.get("grants", [])),
             "validation_scripts": len(ddl_scripts.get("validation_scripts", []))
         })
+
+        print(f"[EXTRACTION] Final extraction_summary constraints: {extraction_summary.get('constraints')}")
 
         extraction_result["extraction_summary"] = extraction_summary
         extraction_result["object_count"] = sum(extraction_summary.values())
@@ -2091,9 +2145,26 @@ async def run_extraction_task():
                 table_names.append(full_name)
             tables_extracted = len(table_names)
             object_count = extraction_result.get("object_count", 0)
+
+            # Get detailed counts for all object types
+            constraints_count = len(extraction_result.get("ddl_scripts", {}).get("constraints", []))
+            indexes_count = len(extraction_result.get("ddl_scripts", {}).get("indexes", []))
+            triggers_count = len(extraction_result.get("ddl_scripts", {}).get("triggers", []))
+            sequences_count = len(extraction_result.get("ddl_scripts", {}).get("sequences", []))
+            views_count = len(extraction_result.get("ddl_scripts", {}).get("views", []))
+            procedures_count = len(extraction_result.get("ddl_scripts", {}).get("procedures", []))
+
+            # Create detailed log message
+            details_msg = (
+                f"tables={tables_extracted}, constraints={constraints_count}, "
+                f"indexes={indexes_count}, triggers={triggers_count}, "
+                f"sequences={sequences_count}, views={views_count}, "
+                f"procedures={procedures_count}, total_objects={object_count}"
+            )
+
             _log_event(
                 "EXTRACTION",
-                f"Extracted structure tables={tables_extracted} objects={object_count}",
+                f"Extracted structure: {details_msg}",
                 run_id=run_id,
                 tables=table_names
             )

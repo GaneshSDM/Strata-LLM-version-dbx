@@ -81,7 +81,7 @@ type StorageEntryList = StorageEntry[]
 
 export default function Analyze({ connections, onAnalysisComplete, onAnalysisRestart }: Props) {
   const navigate = useNavigate()
-  const { notify, resetWizardState, wizardResetId } = useWizard()
+  const { notify, resetWizardState, wizardResetId, setAnalyzeMetrics } = useWizard()
   const [sourceId, setSourceId] = useState('')
   const [targetId, setTargetId] = useState('')
   const [analyzing, setAnalyzing] = useState(false)
@@ -811,10 +811,9 @@ export default function Analyze({ connections, onAnalysisComplete, onAnalysisRes
   const results = analysisResults
   useEffect(() => {
     if (analysisStatus?.done && !hasReportedCompletion) {
-      onAnalysisComplete()
       setHasReportedCompletion(true)
     }
-  }, [analysisStatus?.done, hasReportedCompletion, onAnalysisComplete])
+  }, [analysisStatus?.done, hasReportedCompletion])
 
   const analysisSteps = [
     { label: 'Connecting to databases', start: 0, end: 10 },
@@ -978,10 +977,20 @@ export default function Analyze({ connections, onAnalysisComplete, onAnalysisRes
         selectedColumnRefs.set(normalized, new Set(selected));
       }
     });
-    
-    // If no tables are selected, return all results
-    if (selectedRefs.size === 0) return analysisResults;
-    
+
+    // If no tables are selected, return empty results
+    if (selectedRefs.size === 0) {
+      return {
+        ...analysisResults,
+        tables: [],
+        views: [],
+        materialized_views: [],
+        columns: [],
+        data_profiles: [],
+        constraints: []
+      };
+    }
+
     // Filter tables
     const filteredTables = (analysisResults.tables || []).filter((table: any) => {
       const schema = (table.schema || 'default').toLowerCase();
@@ -1024,7 +1033,71 @@ export default function Analyze({ connections, onAnalysisComplete, onAnalysisRes
       const ref = `${schema}.${table}`;
       return selectedRefs.has(ref) || selectedRefs.has(table);
     });
-    
+
+    // Filter constraints based on selected tables
+    const filteredConstraints = (analysisResults.constraints || []).filter((constraint: any) => {
+      const schema = (constraint.schema || 'default').toLowerCase();
+      const table = (constraint.table || '').toLowerCase();
+      const ref = `${schema}.${table}`;
+      return selectedRefs.has(ref) || selectedRefs.has(table);
+    });
+
+    // Filter indexes based on selected tables
+    const filteredIndexes = (analysisResults.indexes || []).filter((index: any) => {
+      const schema = (index.schema || 'default').toLowerCase();
+      const table = (index.table || '').toLowerCase();
+      const ref = `${schema}.${table}`;
+      return selectedRefs.has(ref) || selectedRefs.has(table);
+    });
+
+    // Filter triggers based on selected tables
+    const filteredTriggers = (analysisResults.triggers || []).filter((trigger: any) => {
+      const schema = (trigger.schema || 'default').toLowerCase();
+      const table = (trigger.table || '').toLowerCase();
+      const ref = `${schema}.${table}`;
+      return selectedRefs.has(ref) || selectedRefs.has(table);
+    });
+
+    // Filter sequences based on selected tables
+    const filteredSequences = (analysisResults.sequences || []).filter((sequence: any) => {
+      const schema = (sequence.schema || 'default').toLowerCase();
+      const table = (sequence.table || '').toLowerCase();
+      const ref = `${schema}.${table}`;
+      return selectedRefs.has(ref) || selectedRefs.has(table);
+    });
+
+    // Filter user types based on selected tables
+    const filteredUserTypes = (analysisResults.user_types || []).filter((type: any) => {
+      const schema = (type.schema || 'default').toLowerCase();
+      const table = (type.table || '').toLowerCase();
+      const ref = `${schema}.${table}`;
+      return selectedRefs.has(ref) || selectedRefs.has(table);
+    });
+
+    // Filter procedures based on selected tables
+    const filteredProcedures = (analysisResults.procedures || []).filter((procedure: any) => {
+      const schema = (procedure.schema || 'default').toLowerCase();
+      const table = (procedure.table || '').toLowerCase();
+      const ref = `${schema}.${table}`;
+      return selectedRefs.has(ref) || selectedRefs.has(table);
+    });
+
+    // Filter permissions based on selected tables
+    const filteredPermissions = (analysisResults.permissions || []).filter((permission: any) => {
+      const schema = (permission.schema || 'default').toLowerCase();
+      const table = (permission.table || '').toLowerCase();
+      const ref = `${schema}.${table}`;
+      return selectedRefs.has(ref) || selectedRefs.has(table);
+    });
+
+    // Filter partitions based on selected tables
+    const filteredPartitions = (analysisResults.partitions || []).filter((partition: any) => {
+      const schema = (partition.schema || 'default').toLowerCase();
+      const table = (partition.table || '').toLowerCase();
+      const ref = `${schema}.${table}`;
+      return selectedRefs.has(ref) || selectedRefs.has(table);
+    });
+
     // Return filtered results
     return {
       ...analysisResults,
@@ -1032,7 +1105,15 @@ export default function Analyze({ connections, onAnalysisComplete, onAnalysisRes
       views: filteredViews,
       materialized_views: filteredMaterializedViews,
       columns: filteredColumns,
-      data_profiles: filteredDataProfiles
+      data_profiles: filteredDataProfiles,
+      constraints: filteredConstraints,
+      indexes: filteredIndexes,
+      triggers: filteredTriggers,
+      sequences: filteredSequences,
+      user_types: filteredUserTypes,
+      procedures: filteredProcedures,
+      permissions: filteredPermissions,
+      partitions: filteredPartitions
     };
   }, [analysisResults, selectedTables, selectedColumns]);
 
@@ -1289,7 +1370,10 @@ export default function Analyze({ connections, onAnalysisComplete, onAnalysisRes
                                   <span className="font-mono font-semibold text-gray-900">{table.name}</span>
                                 </td>
                                 <td className="p-2 text-right font-semibold text-blue-700">
-                                  {table.row_count?.toLocaleString() || '0'}
+                                  {(() => {
+                                    console.log(`Row count for ${table.name}:`, table.row_count, typeof table.row_count)
+                                    return typeof table.row_count === 'number' ? table.row_count.toLocaleString() : (parseInt(table.row_count as string) || 0).toLocaleString()
+                                  })()}
                                 </td>
                                 <td className="p-2">
                                   {tableColumns.length > 0 ? (
@@ -1591,7 +1675,10 @@ export default function Analyze({ connections, onAnalysisComplete, onAnalysisRes
                             <tr className="border-b border-gray-200 hover:bg-orange-50 transition-colors">
                               <td className="p-2 font-mono font-semibold text-gray-900">{table.name}</td>
                               <td className="p-2 text-right font-semibold text-orange-700">
-                                {table.row_count?.toLocaleString() || '0'}
+                                {(() => {
+                                  console.log(`Row count for ${table.name}:`, table.row_count, typeof table.row_count)
+                                  return typeof table.row_count === 'number' ? table.row_count.toLocaleString() : (parseInt(table.row_count as string) || 0).toLocaleString()
+                                })()}
                               </td>
                               <td className="p-2">
                                 {tableColumns.length > 0 && (
@@ -2887,7 +2974,22 @@ export default function Analyze({ connections, onAnalysisComplete, onAnalysisRes
 
           <div className="mt-6 flex justify-end">
             <button
-              onClick={() => navigate('/extract')}
+              onClick={() => {
+                const filtered = getFilteredAnalysisResults
+                setAnalyzeMetrics({
+                  tables: filtered?.tables?.length || 0,
+                  views: filtered?.views?.length || 0,
+                  materialized_views: filtered?.materialized_views?.length || 0,
+                  triggers: filtered?.triggers?.length || 0,
+                  sequences: filtered?.sequences?.length || 0,
+                  indexes: filtered?.indexes?.length || 0,
+                  constraints: filtered?.constraints?.length || 0,
+                  user_types: filtered?.user_types?.length || 0,
+                  procedures: filtered?.procedures?.length || 0
+                })
+                onAnalysisComplete()
+                navigate('/extract')
+              }}
               disabled={invalidSelectedTables.length > 0}
               className="flex items-center gap-2 px-8 py-3 bg-gradient-to-r from-[#ec6225] to-[#ff7a3d] text-white rounded-lg hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed font-medium text-lg"
             >
