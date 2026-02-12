@@ -1,10 +1,45 @@
+#main_fixed.py
 # This file contains the fixed structure migration code
 # The key changes are:
 # 1. Structure migration now runs as a background task (prevents "Failed to fetch")
 # 2. AI translation uses parallel processing with batch_size=5 (faster, prevents timeout)
 # 3. Progress updates work properly for real-time UI feedback
 
-# Add this async function before line 1712 in backend/main.py:
+import importlib
+
+def _import_ai_module():
+    """Import the ai module whether this file was loaded as part of the backend package or as a standalone module."""
+    import importlib
+    
+    # First try the relative import if package is defined
+    if __package__:
+        try:
+            module_name = f"{__package__}.ai"
+            if module_name in sys.modules:
+                # Module already imported - reload it to get latest changes
+                importlib.reload(sys.modules[module_name])
+                return sys.modules[module_name]
+            return importlib.import_module(module_name)
+        except ImportError:
+            pass
+    
+    # Try direct import
+    try:
+        if "ai" in sys.modules:
+            importlib.reload(sys.modules["ai"])
+            return sys.modules["ai"]
+        return importlib.import_module("ai")
+    except ImportError:
+        # Last resort: try to import from current directory
+        import sys
+        import os
+        current_dir = os.path.dirname(__file__)
+        if current_dir not in sys.path:
+            sys.path.insert(0, current_dir)
+        if "ai" in sys.modules:
+            importlib.reload(sys.modules["ai"])
+            return sys.modules["ai"]
+        return importlib.import_module("ai")
 
 async def run_structure_migration_task():
     """
@@ -96,14 +131,16 @@ async def run_structure_migration_task():
                 
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 
+                # No fallback - Databricks endpoint only for all migrations
                 for i, result in enumerate(results):
                     obj = batch[i]
                     if isinstance(result, Exception):
                         print(f"[MIGRATION] AI translation error for {obj.get('name')}: {result}")
-                        result = ai.fallback_translation([obj], source["db_type"], target["db_type"])
+                        result = {"objects": [], "error": str(result)}
                     
                     if not isinstance(result, dict) or not result.get("objects"):
-                        result = ai.fallback_translation([obj], source["db_type"], target["db_type"])
+                        print(f"[MIGRATION] Translation failed for {obj.get('name')} - Databricks endpoint unavailable")
+                        result = {"objects": [], "error": "Databricks endpoint unavailable"}
                     
                     translated_obj = (result.get("objects") or [{}])[0]
                     if translated_obj:

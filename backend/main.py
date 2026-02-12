@@ -43,15 +43,26 @@ def _import_ai_module():
     Import the ai module whether this file was loaded as part of the backend package
     or as a standalone module.
     """
+    import importlib
+    import sys
+    
     # First try the relative import if package is defined
     if __package__:
         try:
-            return importlib.import_module(f"{__package__}.ai")
+            module_name = f"{__package__}.ai"
+            if module_name in sys.modules:
+                # Module already imported - reload it to get latest changes
+                importlib.reload(sys.modules[module_name])
+                return sys.modules[module_name]
+            return importlib.import_module(module_name)
         except ImportError:
             pass
     
     # Try direct import
     try:
+        if "ai" in sys.modules:
+            importlib.reload(sys.modules["ai"])
+            return sys.modules["ai"]
         return importlib.import_module("ai")
     except ImportError:
         # Last resort: try to import from current directory
@@ -60,6 +71,9 @@ def _import_ai_module():
         current_dir = os.path.dirname(__file__)
         if current_dir not in sys.path:
             sys.path.insert(0, current_dir)
+        if "ai" in sys.modules:
+            importlib.reload(sys.modules["ai"])
+            return sys.modules["ai"]
         return importlib.import_module("ai")
 
 # Set up logging
@@ -1002,16 +1016,10 @@ async def convert_ddl(req: ConvertDdlRequest):
                 logger.error(f"/api/ddl/convert AI error: {e}")
                 logger.error(f"Full traceback: {traceback.format_exc()}")
 
+        # No fallback allowed - Databricks endpoint only
         if not isinstance(translation, dict) or not translation.get("objects"):
-            logger.info("Using fallback translation")
-            logger.info(f"Source dialect: {req.sourceDialect}, Target dialect: {req.targetDialect}")
-            logger.info(f"Object data: {obj}")
-            translation = ai.fallback_translation(
-                [obj], req.sourceDialect or "", req.targetDialect or ""
-            )
-            logger.info(f"Fallback translation result: {len(translation.get('objects', []))} objects")
-            if translation.get("objects"):
-                logger.info(f"First translated object: {translation['objects'][0]}")
+            logger.error("Translation failed - Databricks endpoint did not return valid result")
+            translation = {"objects": [], "error": "Translation unavailable"}
 
         translated = (translation.get("objects") or [{}])[0]
         target_sql = translated.get("target_sql", "")
@@ -2416,16 +2424,15 @@ async def run_structure_migration_task():
         if total_objects == 0:
             translation = {"objects": []}
         else:
-            # For structure migration we want deterministic, rule-based SQL that
-            # matches the Target DDL Preview shown on the Extract page. That
-            # preview uses the same fallback translation rules, so here we skip
-            # free-form AI and always use the rule-based translator.
+            # All migrations use Databricks endpoint exclusively (no fallback)
             for idx, obj in enumerate(all_ddl_objects, start=1):
-                result = ai.fallback_translation([obj], source["db_type"], target["db_type"])
+                result = await ai.translate_schema(source["db_type"], target["db_type"], {"objects": [obj]})
                 if isinstance(result, dict) and result.get("objects"):
                     translated_obj = (result.get("objects") or [{}])[0]
                     if translated_obj:
                         translated_objects.append(translated_obj)
+                else:
+                    print(f"[MIGRATION] Translation failed for {obj.get('name')} - Databricks endpoint unavailable")
                 # Update progress as we walk the list (10–30%)
                 progress = 10 + int((idx / total_objects) * 20)
                 await _set_progress(progress, f"Translating objects ({idx}/{total_objects})")
