@@ -499,24 +499,25 @@ class DatabricksAdapter(DatabaseAdapter):
                 "details": "Databricks SQL connector not installed",
                 "message": "Databricks driver not available. Install databricks-sql-connector and restart the backend."
             }
-        
+
         try:
             # Connect asynchronously using thread pool
             def connect_sync():
                 # Defensive programming: validate all required parameters
-                server_hostname = self.credentials.get("host") or self.credentials.get("server_hostname")
+                # Support both frontend field names (server_hostname) and backend aliases (host)
+                server_hostname = self.credentials.get("server_hostname") or self.credentials.get("host")
                 http_path = self.credentials.get("http_path") or self.credentials.get("httpPath")
                 access_token = self.credentials.get("access_token") or self.credentials.get("accessToken")
-                catalog = self.credentials.get("catalog") or self.credentials.get("catalogName", "hive_metastore")
-                schema = self.credentials.get("schema") or self.credentials.get("schemaName", "default")
-                
-                # Validate that required parameters are not None
-                if not server_hostname:
-                    raise ValueError("Server hostname is required for Databricks connection")
-                if not http_path:
-                    raise ValueError("HTTP path is required for Databricks connection")
-                if not access_token:
-                    raise ValueError("Access token is required for Databricks connection")
+                catalog = self.credentials.get("catalog") or self.credentials.get("catalogName") or "hive_metastore"
+                schema = self.credentials.get("schema") or self.credentials.get("schemaName") or "default"
+
+                # Validate that required parameters are not None and not empty strings
+                if not server_hostname or not server_hostname.strip():
+                    raise ValueError("Server hostname is required for Databricks connection. Please provide the Databricks workspace URL.")
+                if not http_path or not http_path.strip():
+                    raise ValueError("HTTP path is required for Databricks connection. Please provide the SQL warehouse HTTP path.")
+                if not access_token or not access_token.strip():
+                    raise ValueError("Access token is required for Databricks connection. Please provide a valid personal access token.")
                 
                 print(f"[DATABRICKS DEBUG] Connecting to {server_hostname}")
                 print(f"[DATABRICKS DEBUG] HTTP Path: {http_path}")

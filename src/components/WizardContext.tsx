@@ -2,12 +2,26 @@ import { createContext, useContext, type ReactNode } from 'react'
 
 export type WizardStepPath = '/' | '/extract'
 
+export type AnalyzeMetrics = {
+  tables: number
+  views: number
+  materialized_views: number
+  triggers: number
+  sequences: number
+  indexes: number
+  constraints: number
+  user_types: number
+  procedures: number
+} | null
+
 export type WizardContextValue = {
   lastWizardPath: WizardStepPath
   setLastWizardPath: (path: WizardStepPath) => void
   wizardResetId: number
   resetWizardState: (message?: string) => void
   notify: (message: string) => void
+  analyzeMetrics: AnalyzeMetrics
+  setAnalyzeMetrics: (metrics: AnalyzeMetrics) => void
 }
 
 const WizardContext = createContext<WizardContextValue | null>(null)

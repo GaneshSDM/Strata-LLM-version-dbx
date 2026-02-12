@@ -942,7 +942,162 @@ class OracleAdapter(DatabaseAdapter):
                     "name": table_name,
                     "ddl": table_ddl
                 })
-            
+
+            # Extract constraints as separate DDL scripts
+            try:
+                constraint_cursor = connection.cursor()
+
+                # Build WHERE clause for selected tables
+                if selected_tables:
+                    table_conditions = []
+                    for table_ref in selected_tables:
+                        table_ref_clean = _clean_identifier(table_ref)
+                        if '.' in table_ref_clean:
+                            schema, table = table_ref_clean.split('.', 1)
+                            table_conditions.append(f"(c.owner = UPPER('{schema}') AND c.table_name = UPPER('{table}'))")
+                        else:
+                            table_conditions.append(f"c.table_name = UPPER('{table_ref_clean}')")
+                    where_clause = "AND (" + " OR ".join(table_conditions) + ")"
+                else:
+                    where_clause = ""
+
+                # Extract all constraints
+                constraint_cursor.execute(f"""
+                    SELECT c.owner, c.table_name, c.constraint_name, c.constraint_type,
+                           c.search_condition, c.r_owner, c.r_constraint_name, c.delete_rule
+                    FROM all_constraints c
+                    WHERE c.constraint_type IN ('P', 'U', 'R', 'C')
+                      AND c.owner NOT IN ('SYS', 'SYSTEM', 'OUTLN', 'XDB')
+                      {where_clause}
+                    ORDER BY c.owner, c.table_name,
+                             DECODE(c.constraint_type, 'P', 1, 'U', 2, 'R', 3, 'C', 4),
+                             c.constraint_name
+                """)
+
+                for row in constraint_cursor.fetchall():
+                    owner, table_name, const_name, const_type, search_cond, r_owner, r_const_name, delete_rule = row
+
+                    # Skip system-generated constraints
+                    if const_name.upper().startswith('SYS_'):
+                        continue
+
+                    # Build constraint DDL based on type
+                    if const_type == 'P':  # Primary Key
+                        # Get columns
+                        col_cursor = connection.cursor()
+                        col_cursor.execute(f"""
+                            SELECT column_name
+                            FROM all_cons_columns
+                            WHERE owner = '{owner}'
+                              AND constraint_name = '{const_name}'
+                            ORDER BY position
+                        """)
+                        cols = [col[0] for col in col_cursor.fetchall()]
+                        col_cursor.close()
+
+                        if cols:
+                            cols_str = ", ".join([f'"{c}"' for c in cols])
+                            ddl = f'ALTER TABLE "{owner}"."{table_name}" ADD CONSTRAINT "{const_name}" PRIMARY KEY ({cols_str});'
+                            extracted_scripts["constraints"].append({
+                                "schema": owner,
+                                "table": table_name,
+                                "name": const_name,
+                                "type": "PRIMARY KEY",
+                                "ddl": ddl
+                            })
+
+                    elif const_type == 'U':  # Unique
+                        # Get columns
+                        col_cursor = connection.cursor()
+                        col_cursor.execute(f"""
+                            SELECT column_name
+                            FROM all_cons_columns
+                            WHERE owner = '{owner}'
+                              AND constraint_name = '{const_name}'
+                            ORDER BY position
+                        """)
+                        cols = [col[0] for col in col_cursor.fetchall()]
+                        col_cursor.close()
+
+                        if cols:
+                            cols_str = ", ".join([f'"{c}"' for c in cols])
+                            ddl = f'ALTER TABLE "{owner}"."{table_name}" ADD CONSTRAINT "{const_name}" UNIQUE ({cols_str});'
+                            extracted_scripts["constraints"].append({
+                                "schema": owner,
+                                "table": table_name,
+                                "name": const_name,
+                                "type": "UNIQUE",
+                                "ddl": ddl
+                            })
+
+                    elif const_type == 'R':  # Foreign Key
+                        # Get columns and referenced table info
+                        col_cursor = connection.cursor()
+                        col_cursor.execute(f"""
+                            SELECT acc.column_name,
+                                   rc.owner AS r_owner,
+                                   rc.table_name AS r_table,
+                                   racc.column_name AS r_column
+                            FROM all_cons_columns acc
+                            JOIN all_constraints rc
+                              ON '{r_owner}' = rc.owner
+                             AND '{r_const_name}' = rc.constraint_name
+                            JOIN all_cons_columns racc
+                              ON rc.owner = racc.owner
+                             AND rc.constraint_name = racc.constraint_name
+                             AND acc.position = racc.position
+                            WHERE acc.owner = '{owner}'
+                              AND acc.constraint_name = '{const_name}'
+                            ORDER BY acc.position
+                        """)
+                        fk_data = col_cursor.fetchall()
+                        col_cursor.close()
+
+                        if fk_data:
+                            cols = [row[0] for row in fk_data]
+                            ref_owner = fk_data[0][1]
+                            ref_table = fk_data[0][2]
+                            ref_cols = [row[3] for row in fk_data]
+
+                            cols_str = ", ".join([f'"{c}"' for c in cols])
+                            ref_cols_str = ", ".join([f'"{c}"' for c in ref_cols])
+
+                            ddl = f'ALTER TABLE "{owner}"."{table_name}" ADD CONSTRAINT "{const_name}" '
+                            ddl += f'FOREIGN KEY ({cols_str}) REFERENCES "{ref_owner}"."{ref_table}" ({ref_cols_str})'
+
+                            if delete_rule:
+                                ddl += f' ON DELETE {delete_rule}'
+
+                            ddl += ';'
+
+                            extracted_scripts["constraints"].append({
+                                "schema": owner,
+                                "table": table_name,
+                                "name": const_name,
+                                "type": "FOREIGN KEY",
+                                "ddl": ddl
+                            })
+
+                    elif const_type == 'C':  # Check Constraint
+                        if search_cond and 'IS NOT NULL' not in str(search_cond).upper():
+                            ddl = f'ALTER TABLE "{owner}"."{table_name}" ADD CONSTRAINT "{const_name}" CHECK ({search_cond});'
+                            extracted_scripts["constraints"].append({
+                                "schema": owner,
+                                "table": table_name,
+                                "name": const_name,
+                                "type": "CHECK",
+                                "ddl": ddl
+                            })
+
+                constraint_cursor.close()
+            except Exception as e:
+                # Best effort - if constraint extraction fails, continue with other objects
+                print(f"Warning: Failed to extract constraints: {e}")
+                try:
+                    constraint_cursor.close()
+                except:
+                    pass
+
             cursor.close()
             
             return {

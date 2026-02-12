@@ -11,7 +11,7 @@ import { ConnectionModal } from './components/ConnectionModal'
 import { Toaster } from './components/ui/toast'
 import LockedStage from './components/LockedStage'
 import { StageKey, StageProgress } from './types/workflow'
-import { WizardProvider, WizardStepPath } from './components/WizardContext'
+import { WizardProvider, WizardStepPath, AnalyzeMetrics } from './components/WizardContext'
 import { ensureSessionId as ensureLogSessionId } from './utils/session'
 
 export type Connection = {
@@ -168,6 +168,7 @@ function App() {
   const [notification, setNotification] = useState<string | null>(null)
   const [lastWizardPath, setLastWizardPath] = useState<WizardStepPath>('/')
   const [wizardResetId, setWizardResetId] = useState(0)
+  const [analyzeMetrics, setAnalyzeMetrics] = useState<AnalyzeMetrics>(null)
   const [runtimeError, setRuntimeError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -263,6 +264,7 @@ function App() {
     resetWorkflowStages()
     setLastWizardPath('/')
     setWizardResetId(prev => prev + 1)
+    setAnalyzeMetrics(null)
     if (message) {
       setNotification(message)
     }
@@ -288,7 +290,7 @@ function App() {
   return (
     <ErrorBoundary onError={(err) => setRuntimeError(err.message)}>
       <BrowserRouter>
-        <WizardProvider value={{ lastWizardPath, setLastWizardPath, wizardResetId, resetWizardState, notify }}>
+        <WizardProvider value={{ lastWizardPath, setLastWizardPath, wizardResetId, resetWizardState, notify, analyzeMetrics, setAnalyzeMetrics }}>
           <Layout
             onOpenSettings={() => setShowConnectionModal(true)}
             onLogout={() => {
