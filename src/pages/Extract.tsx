@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { ArrowLeft, FileText, FileSpreadsheet, FileJson, Database, Table, Eye, Zap, Hash, Box, Lock, Code } from 'lucide-react'
+import { useNavigate, useLocation } from 'react-router-dom'
+import { ArrowLeft, FileText, FileSpreadsheet, FileJson, Database, Table, Eye, Zap, Hash, Box, Lock, Code, RefreshCw } from 'lucide-react'
 import { useWizard } from '../components/WizardContext'
 import { ensureSessionId, getSessionHeaders } from '../utils/session'
 
@@ -10,7 +10,9 @@ type ExtractProps = {
 
 export default function Extract({ onExtractionComplete }: ExtractProps) {
   const navigate = useNavigate()
-  const { wizardResetId } = useWizard()
+  const location = useLocation()
+  const isVisible = location.pathname === '/extract'
+  const { wizardResetId, analyzeMetrics } = useWizard()
   const [extracting, setExtracting] = useState(false)
   const [status, setStatus] = useState<any>(null)
   const [activeTab, setActiveTab] = useState('overview')
@@ -61,7 +63,11 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
   }
 
   const results = status?.results
-  const summary = results?.extraction_summary || {}
+  const backendSummary = results?.extraction_summary || {}
+  // Use analyze-page filtered metrics when available, falling back to backend summary
+  const summary = analyzeMetrics
+    ? { ...backendSummary, ...analyzeMetrics }
+    : backendSummary
   const extractionSteps = [
     { label: 'Connecting to source', start: 0, end: 10 },
     { label: 'Reading schema metadata', start: 10, end: 35 },
@@ -88,16 +94,12 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
     setAutoTriggerCountdown(8)
   }, [wizardResetId])
 
-  // Auto-trigger extraction after component mount
+  // Auto-trigger extraction only when the page is actually visible
   useEffect(() => {
-    // Ensures auto-trigger happens only on first arrival to this page
-    // Only auto-trigger if:
-    // 1. Not already extracting
-    // 2. No status exists (not a re-run)
-    // 3. autoTriggerState is still 'preparing'
-    if (extracting || status?.done || autoTriggerState !== 'preparing') {
-      return
-    }
+    if (!isVisible) return
+    if (extracting || status?.done || autoTriggerState !== 'preparing') return
+
+    setAutoTriggerCountdown(8)
 
     // Countdown interval (updates UI every second)
     const countdownInterval = setInterval(() => {
@@ -112,10 +114,8 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
 
     // Auto-trigger timeout (8 seconds)
     const autoTriggerTimeout = setTimeout(() => {
-      if (!extracting && !status?.done) {
-        startExtraction()
-        setAutoTriggerState('triggered')
-      }
+      startExtraction()
+      setAutoTriggerState('triggered')
     }, 8000)
 
     // Cleanup function prevents memory leaks
@@ -123,12 +123,19 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
       clearInterval(countdownInterval)
       clearTimeout(autoTriggerTimeout)
     }
-  }, []) // Empty dependency array = run once on mount
+  }, [isVisible]) // Only trigger when page becomes visible
 
-  // Scroll to top on page load
+  // Scroll to top when Extract page becomes visible
   useEffect(() => {
-    window.scrollTo(0, 0)
-  }, [])
+    if (isVisible) {
+      // The scrollable container is the <main> element in Layout, not the window
+      const mainEl = document.querySelector('main')
+      if (mainEl) {
+        mainEl.scrollTo(0, 0)
+      }
+      window.scrollTo(0, 0)
+    }
+  }, [isVisible])
 
   useEffect(() => {
     const loadSession = async () => {
@@ -443,6 +450,20 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
               : 'Auto Extraction in Progress...'}
           </button>
 
+          {status?.done && (
+            <button
+              onClick={() => {
+                setStatus(null)
+                startExtraction()
+                setAutoTriggerState('triggered')
+              }}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg border-2 border-[#085690] text-[#085690] bg-white hover:bg-[#085690] hover:text-white transition-all font-medium"
+            >
+              <RefreshCw size={18} />
+              Re-Extract
+            </button>
+          )}
+
           {status && status.done && (
             <>
               <button
@@ -553,7 +574,7 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
         </div>
       )}
 
-      {status && status.done && results && (
+      {((status && status.done && results) || analyzeMetrics) && (
         <>
           <div className="grid grid-cols-4 gap-4 mb-6">
             <MetricCard icon={Database} label="User Types" value={summary.user_types} color="#085690" />
@@ -575,7 +596,11 @@ export default function Extract({ onExtractionComplete }: ExtractProps) {
             <MetricCard icon={Lock} label="Grants" value={summary.grants} color="#085690" />
             <MetricCard icon={Box} label="Validation Scripts" value={summary.validation_scripts} color="#ec6225" />
           </div>
+        </>
+      )}
 
+      {status && status.done && results && (
+        <>
           <div className="bg-white rounded-lg shadow border-t-4 border-[#085690]">
             <div className="border-b border-gray-200">
               <div className="flex gap-1 p-2 overflow-x-auto">
